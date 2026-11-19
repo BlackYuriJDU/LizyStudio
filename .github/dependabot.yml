@@ -26,7 +26,7 @@ updates:
       # openapi-typescript (peer typescript ^5.x) crashes in generate:api
       # with "Cannot read properties of undefined (reading
       # 'createKeywordTypeNode')". Hold the major until openapi-typescript
-      # supports it; see issue #TS7_ISSUE.
+      # supports it; see issue #762.
       - dependency-name: "typescript"
         update-types: ["version-update:semver-major"]
     groups:
