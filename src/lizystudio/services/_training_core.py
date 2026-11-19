@@ -185,7 +185,14 @@ def _fail_escaped_job(
     that is not terminal yet is stamped ``failed``, broadcast and counted;
     a terminal status written before the exception (by ``_run_job_core``,
     a cancel, or the subprocess child) is kept. The slot and the job's
-    cancel and pause flags are released either way.
+    cancel and pause flags are released either way, in a ``finally`` so a
+    failure of this handler cannot skip them.
+
+    In thread mode *job* is the instance ``_run_job_core`` mutated. When it
+    is terminal in memory but not on disk, the core's ``finally`` already
+    counted the terminal metric and only the persistence (and so the
+    broadcast, which follows a successful write) failed: the handler then
+    persists and broadcasts without counting again.
     """
     message = f"{type(exc).__name__}: {exc}"
     _logger.error(
@@ -194,19 +201,27 @@ def _fail_escaped_job(
         job.job_type,
         exc_info=exc,
     )
-    current = job_store.get(job.job_id)
-    if current is not None and current.status not in _TERMINAL_STATUSES:
-        current.status = "failed"
-        current.error = f"worker crashed: {message}"
-        current.completed_at = datetime.now(timezone.utc).isoformat()
-        job_store.update(current)
-        ws.note_current_job(current.job_id, epoch=epoch)
-        if broadcaster is not None:
-            broadcaster.send_error(current.job_id, current.error)
-        job_store.record_job_terminal(current.job_type, "failed")
-    job_store.release_active(job.job_id)
-    job_store.clear_cancel(job.job_id)
-    job_store.clear_pause(job.job_id)
+    try:
+        current = job_store.get(job.job_id)
+        if current is not None and current.status not in _TERMINAL_STATUSES:
+            already_counted = job.status in _TERMINAL_STATUSES
+            current.status = "failed"
+            current.error = f"worker crashed: {message}"
+            current.completed_at = datetime.now(timezone.utc).isoformat()
+            job_store.update(current)
+            ws.note_current_job(current.job_id, epoch=epoch)
+            if broadcaster is not None:
+                broadcaster.send_error(current.job_id, current.error)
+            if not already_counted:
+                job_store.record_job_terminal(current.job_type, "failed")
+    except Exception:  # noqa: BLE001 — log it; the cleanup below must run
+        _logger.exception(
+            "event='training.worker_crash_settle_failed' job=%s", job.job_id
+        )
+    finally:
+        job_store.release_active(job.job_id)
+        job_store.clear_cancel(job.job_id)
+        job_store.clear_pause(job.job_id)
 
 
 @contextmanager

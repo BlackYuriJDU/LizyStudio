@@ -15,6 +15,8 @@ it, and the failure is broadcast exactly once.
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -63,6 +65,30 @@ def backend() -> MagicMock:
 @pytest.fixture(autouse=True)
 def _thread_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(openmp_detect_mod, "should_use_subprocess", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _no_thread_escapes(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Fail any test whose worker thread lets an exception escape."""
+    escaped: list[BaseException | None] = []
+    monkeypatch.setattr(
+        threading, "excepthook", lambda args: escaped.append(args.exc_value)
+    )
+    yield
+    assert escaped == []
+
+
+def _count_terminal(job_store: JobStore, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every terminal-metric outcome the store is asked to count."""
+    counted: list[str] = []
+    original = job_store.record_job_terminal
+
+    def spy(job_type: str, outcome: str, **kwargs: Any) -> None:
+        counted.append(outcome)
+        original(job_type, outcome, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(job_store, "record_job_terminal", spy)
+    return counted
 
 
 def _data_ref() -> DataRef:
@@ -235,4 +261,106 @@ def test_guard_does_not_overwrite_a_terminal_status(
     assert refreshed is not None
     assert refreshed.status == "completed"
     assert job_store.active_job_id is None
+    broadcaster.send_error.assert_not_called()
+
+
+def test_cleanup_runs_even_when_settling_the_job_raises(
+    job_store: JobStore, backend: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard's own write fails too: the slot and the job's cancel and
+    pause flags are still released, and nothing escapes the thread."""
+
+    def boom(**_: Any) -> Any:
+        raise RuntimeError("synthetic escape")
+
+    def broken_update(_job: Job) -> None:
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(training_mod, "_run_job_core", boom)
+    broadcaster = MagicMock(spec=ProgressBroadcaster)
+    job = _claimed_job(job_store, "tune")
+    job_store.request_cancel(job.job_id)
+    job_store.request_pause(job.job_id)
+    monkeypatch.setattr(job_store, "update", broken_update)
+    ws = WorkspaceState(backend=backend)
+
+    start_tune_async(
+        ws=ws,
+        job_store=job_store,
+        broadcaster=broadcaster,
+        config=_CONFIG,
+        dataframe=pd.DataFrame({"x": [1, 2, 3], "y": [0, 1, 0]}),
+        job=job,
+    )
+    _join(ws)
+
+    assert job_store.active_job_id is None
+    assert job_store.is_cancel_requested(job.job_id) is False
+    assert job_store.is_pause_requested(job.job_id) is False
+    broadcaster.send_error.assert_not_called()
+
+
+def test_a_failed_terminal_write_is_counted_and_broadcast_once(
+    job_store: JobStore, backend: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core decides ``failed`` and counts it, but persisting it raises.
+    The guard persists and broadcasts the failure without counting it again."""
+    backend.fit.side_effect = RuntimeError("synthetic fit failure")
+    counted = _count_terminal(job_store, monkeypatch)
+    original_update = job_store.update
+    failed_writes = {"n": 0}
+
+    def flaky_update(job_obj: Job) -> None:
+        if job_obj.status == "failed" and failed_writes["n"] == 0:
+            failed_writes["n"] += 1
+            raise OSError("synthetic disk failure")
+        original_update(job_obj)
+
+    monkeypatch.setattr(job_store, "update", flaky_update)
+    broadcaster = MagicMock(spec=ProgressBroadcaster)
+    job = _claimed_job(job_store, "fit")
+    ws = WorkspaceState(backend=backend)
+
+    start_fit_async(
+        ws=ws,
+        job_store=job_store,
+        broadcaster=broadcaster,
+        config=_CONFIG,
+        dataframe=pd.DataFrame({"x": [1, 2, 3], "y": [0, 1, 0]}),
+        job=job,
+    )
+    _join(ws)
+
+    assert failed_writes["n"] == 1
+    refreshed = job_store.get(job.job_id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert counted == ["failed"]
+    broadcaster.send_error.assert_called_once()
+    assert job_store.active_job_id is None
+
+
+def test_subprocess_reconcile_persists_before_broadcasting(
+    job_store: JobStore,
+) -> None:
+    """If the reconcile write raises, no error frame has been sent yet, so
+    the launcher's guard sends the only one."""
+    from lizystudio.services.subprocess_runner import _reconcile_subprocess_result
+
+    job = _claimed_job(job_store, "fit")
+    job.status = "running"
+    job_store.update(job)
+    broadcaster = MagicMock(spec=ProgressBroadcaster)
+
+    def broken_update(_job: Job) -> None:
+        raise OSError("synthetic disk failure")
+
+    job_store.update = broken_update  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        _reconcile_subprocess_result(
+            job=job,
+            job_store=job_store,
+            broadcaster=broadcaster,
+            returncode=1,
+        )
     broadcaster.send_error.assert_not_called()
