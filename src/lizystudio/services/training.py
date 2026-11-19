@@ -27,6 +27,7 @@ from lizystudio.services._training_core import (  # noqa: F401
     CancelledError,
     PreviousJobStillRunningError,
     _emit_terminal_metric,
+    _fail_escaped_job,
     _join_previous_thread,
     _make_cancel_aware_cb,
     _prepare_autofit_config,
@@ -306,11 +307,8 @@ def run_tune(
     The default ``False`` preserves the legacy single-shot behaviour
     for initial Tune jobs that POST through ``/api/tune``.
     """
-    tune_config = _prepare_tune_config(config)
-    re_tune = _extract_re_tune(config)
     # H-0062: checkpoint directory for incremental trial persistence.
     checkpoint_dir = job_store.job_dir(job.job_id)
-    _run_pickle_preflight(backend, checkpoint_dir)
     # P-0099 v3-20b: persistent Optuna storage per job. The job
     # directory is created lazily by the JobStore, so by the time
     # we hit lizyml's tuner the parent dir already exists for
@@ -318,15 +316,19 @@ def run_tune(
     storage_url = _build_optuna_storage_url(checkpoint_dir)
     study_name = _build_optuna_study_name(job.job_id)
 
-    # P-0109 PR-6b (Issue #527 re-enablement, ships with #554): warn-only
-    # INV-T3 drift assertion. The forward path through
-    # ``materialize_tuning_for_job`` already guarantees this contract;
-    # this check surfaces drift from non-API callers (raw YAML import,
-    # direct curl). Invocation was deferred while ``tune-resume.spec.ts``
-    # was flaky on the n_trials budget bug (#554), now fixed.
-    _assert_inv_t3(tune_config, backend, job_id=job.job_id)
-
     def execute(cb: ProgressCallback) -> tuple[FitSummary, TuningSummary | None, str]:
+        # Issue #612: the config preparation and the pickle preflight run
+        # inside the core, so an exception here fails the job and releases
+        # the active slot instead of escaping before ``_run_job_core``.
+        tune_config = _prepare_tune_config(config)
+        re_tune = _extract_re_tune(config)
+        _run_pickle_preflight(backend, checkpoint_dir)
+        # P-0109 PR-6b (Issue #527 re-enablement, ships with #554): warn-only
+        # INV-T3 drift assertion. The forward path through
+        # ``materialize_tuning_for_job`` already guarantees this contract;
+        # this check surfaces drift from non-API callers (raw YAML import,
+        # direct curl).
+        _assert_inv_t3(tune_config, backend, job_id=job.job_id)
         model = backend.create_model(tune_config, dataframe)
         tune_result: TuningSummary = backend.tune(
             model,
@@ -383,21 +385,31 @@ def start_fit_async(
     use_subprocess = should_use_subprocess()
 
     def _run() -> None:
-        if use_subprocess:
-            _run_subprocess_job(ws, job, job_store, broadcaster, epoch=epoch)
-        else:
-            finished = run_fit(
+        try:
+            if use_subprocess:
+                _run_subprocess_job(ws, job, job_store, broadcaster, epoch=epoch)
+            else:
+                finished = run_fit(
+                    job=job,
+                    job_store=job_store,
+                    backend=ws.backend,
+                    config=config,
+                    dataframe=dataframe,
+                    broadcaster=broadcaster,
+                )
+                ws.record_completion(
+                    fit_result=finished.fit_result,
+                    tune_result=None,
+                    job_id=finished.job_id,
+                    epoch=epoch,
+                )
+        except Exception as exc:  # noqa: BLE001 — Issue #612: settle, never leak
+            _fail_escaped_job(
+                ws=ws,
                 job=job,
                 job_store=job_store,
-                backend=ws.backend,
-                config=config,
-                dataframe=dataframe,
                 broadcaster=broadcaster,
-            )
-            ws.record_completion(
-                fit_result=finished.fit_result,
-                tune_result=None,
-                job_id=finished.job_id,
+                exc=exc,
                 epoch=epoch,
             )
 
@@ -433,29 +445,39 @@ def start_tune_async(
     use_subprocess = should_use_subprocess()
 
     def _run() -> None:
-        if use_subprocess:
-            _run_subprocess_job(
-                ws,
-                job,
-                job_store,
-                broadcaster,
-                resume_from_existing_study=resume_from_existing_study,
-                epoch=epoch,
-            )
-        else:
-            finished = run_tune(
+        try:
+            if use_subprocess:
+                _run_subprocess_job(
+                    ws,
+                    job,
+                    job_store,
+                    broadcaster,
+                    resume_from_existing_study=resume_from_existing_study,
+                    epoch=epoch,
+                )
+            else:
+                finished = run_tune(
+                    job=job,
+                    job_store=job_store,
+                    backend=ws.backend,
+                    config=config,
+                    dataframe=dataframe,
+                    broadcaster=broadcaster,
+                    resume_from_existing_study=resume_from_existing_study,
+                )
+                ws.record_completion(
+                    fit_result=finished.fit_result,
+                    tune_result=finished.tune_result,
+                    job_id=finished.job_id,
+                    epoch=epoch,
+                )
+        except Exception as exc:  # noqa: BLE001 — Issue #612: settle, never leak
+            _fail_escaped_job(
+                ws=ws,
                 job=job,
                 job_store=job_store,
-                backend=ws.backend,
-                config=config,
-                dataframe=dataframe,
                 broadcaster=broadcaster,
-                resume_from_existing_study=resume_from_existing_study,
-            )
-            ws.record_completion(
-                fit_result=finished.fit_result,
-                tune_result=finished.tune_result,
-                job_id=finished.job_id,
+                exc=exc,
                 epoch=epoch,
             )
 
