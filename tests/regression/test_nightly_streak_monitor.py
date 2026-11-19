@@ -65,10 +65,39 @@ def _tracked_jobs(source: str, where: Path) -> list[str]:
         raise AssertionError(
             f"expected one TRACKED_JOBS literal in {where}, found {len(matches)}"
         )
-    names = re.findall(r'"([^"]+)"', matches[0])
+    # Consume the whole array body: every element must be a double-quoted
+    # name followed by an optional comma. Anything else (a single-quoted or
+    # template string, a variable, a comment) is refused rather than
+    # skipped, so a tracked name can never escape the check below.
+    body = matches[0]
+    names: list[str] = []
+    pos = 0
+    element = re.compile(r'\s*"([^"\\]+)"\s*(?:,|(?=\s*$))')
+    while body[pos:].strip():
+        found = element.match(body, pos)
+        if found is None:
+            raise AssertionError(
+                f"unsupported TRACKED_JOBS element in {where}: {body[pos:].strip()!r}"
+            )
+        names.append(found.group(1))
+        pos = found.end()
     if not names:
         raise AssertionError(f"TRACKED_JOBS in {where} names no job")
     return names
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "const TRACKED_JOBS = [\n  'nonexistent',\n  \"mutation-test\",\n];",
+        'const TRACKED_JOBS = [\n  "mutation-test",\n  OTHER,\n];',
+        "const TRACKED_JOBS = [\n  `mutation-test`,\n];",
+        "const TRACKED_JOBS = [\n];",
+    ],
+)
+def test_tracked_jobs_parser_refuses_what_it_cannot_read(literal: str) -> None:
+    with pytest.raises(AssertionError):
+        _tracked_jobs(literal, WORKFLOW)
 
 
 def test_tracked_jobs_name_real_nightly_jobs() -> None:
