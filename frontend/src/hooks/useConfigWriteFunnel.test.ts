@@ -590,6 +590,104 @@ describe("useConfigWriteFunnel", () => {
     });
   });
 
+  it("resolves ops enqueued while a same-reason PUT is in flight with their own PUT's result, not the in-flight one (#614)", async () => {
+    const { ApiError } = await import("@/api/client");
+    const locked = new ApiError(409, {
+      error: {
+        code: "WORKSPACE_LOCKED",
+        message: "Config is locked while job xyz is running",
+        details: { job_id: "xyz" },
+      },
+    });
+    let resolveFirst: (v: ConfigSnapshot) => void = () => {};
+    const putConfig = vi.fn().mockImplementation(() => {
+      if (putConfig.mock.calls.length === 1) {
+        return new Promise<ConfigSnapshot>((res) => {
+          resolveFirst = res;
+        });
+      }
+      return Promise.reject(locked);
+    });
+    const { result } = renderHook(() =>
+      useConfigWriteFunnel({ getCachedConfig: () => undefined, putConfig }),
+    );
+
+    const p1 = result.current.enqueueWrite({
+      kind: "replace",
+      config: { split: { method: "kfold" } },
+      reason: "cv-change",
+    });
+    await flushMicrotasks();
+    expect(putConfig).toHaveBeenCalledTimes(1);
+    const p2 = result.current.enqueueWrite({
+      kind: "replace",
+      config: { split: { method: "stratified_kfold" } },
+      reason: "cv-change",
+    });
+    const p3 = result.current.enqueueWrite({
+      kind: "replace",
+      config: { split: { method: "time_series" } },
+      reason: "cv-change",
+    });
+
+    resolveFirst({ split: { method: "kfold" } });
+    const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+
+    expect(putConfig).toHaveBeenCalledTimes(2);
+    expect(r1).toEqual({ ok: true, saved: { split: { method: "kfold" } } });
+    // p2 and p3 were coalesced into the second PUT, which was rejected.
+    for (const r of [r2, r3]) {
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error).toBe("locked");
+        expect(r.details).toBe(locked);
+      }
+    }
+  });
+
+  it("resolves each op with the PUT that carried it when reasons interleave (#614)", async () => {
+    let resolveFirst: (v: ConfigSnapshot) => void = () => {};
+    const putConfig = vi.fn().mockImplementation((body: ConfigSnapshot) => {
+      if (putConfig.mock.calls.length === 1) {
+        return new Promise<ConfigSnapshot>((res) => {
+          resolveFirst = res;
+        });
+      }
+      return Promise.resolve(body);
+    });
+    const { result } = renderHook(() =>
+      useConfigWriteFunnel({ getCachedConfig: () => undefined, putConfig }),
+    );
+
+    const p1 = result.current.enqueueWrite({
+      kind: "replace",
+      config: { step: 1 },
+      reason: "cv-change",
+    });
+    await flushMicrotasks();
+    const p2 = result.current.enqueueWrite({
+      kind: "replace",
+      config: { step: 2 },
+      reason: "config-form-edit",
+    });
+    // Same reason as the in-flight p1, but queued behind p2: a separate PUT.
+    const p3 = result.current.enqueueWrite({
+      kind: "replace",
+      config: { step: 3 },
+      reason: "cv-change",
+    });
+
+    resolveFirst({ step: 1 });
+    const results = await Promise.all([p1, p2, p3]);
+
+    expect(putConfig).toHaveBeenCalledTimes(3);
+    expect(results).toEqual([
+      { ok: true, saved: { step: 1 } },
+      { ok: true, saved: { step: 2 } },
+      { ok: true, saved: { step: 3 } },
+    ]);
+  });
+
   it("serialises ops with different reasons (no two PUTs in flight)", async () => {
     const inFlight: ConfigSnapshot[] = [];
     let resolveFirst: (v: ConfigSnapshot) => void = () => {};
