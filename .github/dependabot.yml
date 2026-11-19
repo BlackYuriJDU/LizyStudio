@@ -22,6 +22,13 @@ updates:
       # on v6 still flow through dev-minor-patch.
       - dependency-name: "vite"
         update-types: ["version-update:semver-major"]
+      # TypeScript 7 (the native compiler) ships no JS compiler API, so
+      # openapi-typescript (peer typescript ^5.x) crashes in generate:api
+      # with "Cannot read properties of undefined (reading
+      # 'createKeywordTypeNode')". Hold the major until openapi-typescript
+      # supports it; see issue #TS7_ISSUE.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
     groups:
       # Keep react + react-dom + their types in lock-step.
       react-ecosystem:
