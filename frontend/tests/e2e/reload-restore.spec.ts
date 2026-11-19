@@ -33,7 +33,8 @@ test.describe("Reload restoration", () => {
   // subprocess with SIGTERM mid-fit. The mid-running variant is more
   // sensitive to that than the post-completion variant because it
   // races the worker's status flip. Excluded from the blocking
-  // chromium job until the resource-pressure root cause is fixed.
+  // chromium job until the resource-pressure root cause is fixed;
+  // tracked in #617, run nightly by the `e2e-ci-flaky` job.
   test("UI: reload mid-running fit re-attaches Results panel @ci-flaky", async ({
     page,
     request,

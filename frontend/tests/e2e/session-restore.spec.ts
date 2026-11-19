@@ -37,7 +37,8 @@ test.describe("Session Restore", () => {
   // value came through.  Local runs pass deterministically.  Excluded
   // from the blocking e2e-chromium job via
   // ``--grep-invert=...|@ci-flaky`` until a dedicated investigation
-  // fixes the resource-pressure root cause.
+  // fixes the resource-pressure root cause. Tracked in #617; run
+  // nightly by the `e2e-ci-flaky` job (.github/workflows/nightly.yml).
   test("API: /workspace/status surfaces current_job_id after fit completes @ci-flaky", async ({
     request,
   }) => {

@@ -19,6 +19,7 @@ against stubbed Octokit objects (``streak_monitor_harness.mjs``).
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,6 +52,37 @@ def _extract_script() -> str:
             f"found {len(bodies)}"
         )
     return bodies[0]
+
+
+NIGHTLY = REPO_ROOT / ".github" / "workflows" / "nightly.yml"
+_LIST_RE = re.compile(r"const TRACKED_JOBS = \[(.*?)\];", re.DOTALL)
+
+
+def _tracked_jobs(source: str, where: Path) -> list[str]:
+    """The quoted names inside a ``const TRACKED_JOBS = [...]`` literal."""
+    matches = _LIST_RE.findall(source)
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one TRACKED_JOBS literal in {where}, found {len(matches)}"
+        )
+    names = re.findall(r'"([^"]+)"', matches[0])
+    if not names:
+        raise AssertionError(f"TRACKED_JOBS in {where} names no job")
+    return names
+
+
+def test_tracked_jobs_name_real_nightly_jobs() -> None:
+    """Every job the monitor tracks is a job ``nightly.yml`` runs, and the
+    harness tracks the same list (Issue #617). A name that matches no job
+    is never "executed", so the monitor would skip it silently."""
+    monitor = _tracked_jobs(_extract_script(), WORKFLOW)
+    harness = _tracked_jobs(HARNESS.read_text(encoding="utf-8"), HARNESS)
+    nightly = yaml.safe_load(NIGHTLY.read_text(encoding="utf-8"))
+    job_names = {job.get("name", key) for key, job in nightly["jobs"].items()}
+
+    assert harness == monitor
+    missing = [name for name in monitor if name not in job_names]
+    assert missing == [], f"tracked jobs absent from {NIGHTLY}: {missing}"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")

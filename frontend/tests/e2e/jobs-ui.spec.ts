@@ -370,6 +370,7 @@ test.describe("Jobs page UI (B-1)", () => {
    * @ci-flaky — depends on a long-running tune subprocess being in
    * "running" when the pause request lands; CI runners occasionally
    * SIGTERM the subprocess mid-tune (see session-restore.spec.ts).
+   * Tracked in #617; run nightly by the `e2e-ci-flaky` job.
    */
   test("Pause / Resume buttons drive backend state transitions through the UI @ci-flaky", async ({
     page,
