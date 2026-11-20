@@ -17,7 +17,7 @@ A job-lifecycle reliability release. Job status, the cancel and pause flags, and
 - **Stop running jobs before upgrading.** A job that is running or paused during the upgrade is settled by startup recovery when the new server starts.
   - A job whose cancel had been accepted ends `cancelled`.
   - A job that was running ends `failed`.
-  - A paused job stays paused.
+  - The newest paused job without an accepted cancel stays paused. Any other paused job ends `failed`, as before.
 
 ### Fixed
 
@@ -31,13 +31,18 @@ A job-lifecycle reliability release. Job status, the cancel and pause flags, and
   - A client that reads `paused` and unpauses at once, or reads `completed` and starts a Re-tune at once, no longer gets 409.
   - A `completed` job's result files exist before its status reads `completed`.
 - **Config writes (#614).** Each config write resolves with the PUT that carried it. Before, a burst of same-reason writes could resolve against a different PUT, and an earlier failure could be reported as a later success.
-- **Form renderer (#627).** Editing a field inside an array item keeps the array, and a union field shows the variant that matches its value.
+- **Form renderer (#627).** Editing a field inside an array item keeps the array. A discriminated `anyOf` union field shows the variant its value matches, not always the first.
 - **CLI (#737).** `lizystudio` keeps `LIZYSTUDIO_JOBS_DIR` and `LIZYSTUDIO_BACKEND` when they are already set. The precedence is: an explicit flag, then an existing variable, then the default.
 
 ### Changed
 
 - **A second concurrent `POST /jobs/{id}/unpause`** answers 400 `JOB_NOT_PAUSED` at once.
 - **A new job is `running` from the moment it is admitted,** so Cancel works during setup. A cancel of a `pending` job is accepted.
+- **`DELETE /jobs/{id}` refuses a job that is being set up** with 400 `JOB_RUNNING`, as it refuses a running job. That includes a job admitted while the delete request is in flight.
+- **409 `JOB_CONFLICT` also answers a launch refused at admission.** This applies to `POST /workspace/fit`, `/workspace/tune` and `/jobs/{id}/unpause`. A launch is refused when the workspace was reset after the request was received, or when the previous worker does not finish in time.
+  - A refused new fit or tune job ends `cancelled` after a reset, and `failed` otherwise.
+  - A refused unpause leaves the job `paused`.
+- **`POST /jobs/{id}/pause` after an accepted cancel** answers 400 `JOB_NOT_RUNNING`, even while the job still reads `running`. The cancel wins.
 - **A cancel accepted before a job's terminal write wins:** the job ends `cancelled` even if its work had finished. The result files stay on disk.
 - **`POST /jobs/{id}/retune` and `/resume`** answer 409 `JOB_CONFLICT` when another job holds the active slot. They also claim the slot in subprocess mode, as `/fit` and `/tune` do.
 - **`POST /jobs/{id}/cancel` and `/pause`** answer 500 `CANCEL_NOT_PERSISTED` / `PAUSE_NOT_PERSISTED` when the flag file cannot be written. Before, they answered 200 for a cancel that a restart would lose.
