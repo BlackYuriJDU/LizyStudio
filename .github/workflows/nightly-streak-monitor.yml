@@ -50,6 +50,7 @@ jobs:
             const TRACKED_JOBS = [
               "mutation-test",
               "E2E visual + a11y (Nightly, non-blocking)",
+              "E2E ci-flaky (Nightly, non-blocking)",
             ];
             const ISSUE_LABEL = "streak-alert";
             const dryRun = process.env.DRY_RUN === "true";
