@@ -342,23 +342,29 @@ def _reconcile_subprocess_result(
 
     if updated.status in ("pending", "running"):
         now = datetime.now(timezone.utc).isoformat()
-        if job_store.is_cancel_requested(job.job_id):
+        cancelled = job_store.is_cancel_requested(job.job_id)
+        failure = (
+            f"Subprocess exited with code {returncode} "
+            f"without persisting a terminal status"
+        )
+        if cancelled:
             updated.status = "cancelled"
-            if broadcaster is not None:
+        else:
+            updated.status = "failed"
+            updated.error = failure
+        updated.completed_at = now
+        # Issue #612: persist before broadcasting. If the write raises, the
+        # launcher's guard settles the job and sends the one error frame;
+        # broadcasting first would make that a second frame.
+        job_store.update(updated)
+        job_store.clear_cancel(job.job_id)
+        if broadcaster is not None:
+            if cancelled:
                 broadcaster.send_error(
                     job.job_id, "Job cancelled", code="JOB_CANCELLED"
                 )
-        else:
-            updated.status = "failed"
-            updated.error = (
-                f"Subprocess exited with code {returncode} "
-                f"without persisting a terminal status"
-            )
-            if broadcaster is not None:
-                broadcaster.send_error(job.job_id, updated.error)
-        updated.completed_at = now
-        job_store.update(updated)
-        job_store.clear_cancel(job.job_id)
+            else:
+                broadcaster.send_error(job.job_id, failure)
     return updated
 
 
