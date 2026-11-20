@@ -387,9 +387,9 @@ paused  → failed       (複数 paused の recover)
 **Job lifecycle の不変条件（P-0119、Issue #613 / #697）:** job の status、cancel / pause flag、active slot、job ごとの run token（親の memory にある世代番号）、lifecycle の reset 世代は、親 process の 1 つの lock（`JobLifecycle.lock`）の下でだけ動く。
 
 - **INV-LC-1**: 1 つの job について、受付を通った run は同時に高々 1 つである。違反: 同じ job id の worker が 2 つ起動する。
-- **INV-LC-2**: 終端は 1 度だけ書かれ、書き換えられない。終端の通知と metric は、その書き込みに従って 1 度だけ出る。違反: 終端のあとに別の status が書かれる。あるいは、書かれなかった終端の通知、または 2 度目の通知が出る。
+- **INV-LC-2**: 終端は 1 度だけ書かれ、書き換えられない。終端の通知と metric は、その書き込みに従って 1 度だけ出る。起動時の `recover` が書いた終端も同じで、`recover` はその effects を返し、server の lifespan が broadcaster を作った直後に 1 度だけ出す（metric を 1 回数え、frame は P-0093 の replay cache に入るので、再接続した client に届く）。`force_release` は `cancelled` の書き込みが公開されてから token を失効させ slot を解放する。書き込みが失敗すれば何も失効させず、run 自身の後の commit が終端を書ける。違反: 終端のあとに別の status が書かれる。あるいは、書かれなかった終端の通知、または 2 度目の通知が出る。
 - **INV-LC-3**: 親の slot を持てるのは次の 3 つだけである（thread / subprocess の両方）: `create_and_reserve` から受付までの `pending` の予約（同じ request の中）、受付を通った live な run、`paused` の job。違反: live な run の slot が空になる、または別の job が slot を持つ。例外は Q1 の force-release の後の thread だけである。
-- **INV-LC-4**: API が 200 で受け付けた cancel は失われず、再起動を越えても残る。それより後に書かれる終端は `cancelled` である（Q2: worker が先に結果を出していても `cancelled`。結果の sidecar は disk に残るが、workspace には結果を記録しない — `record_completion` は結果なしで呼ばれ、`current_job_id` はその job を指す）。terminal の書き込みが失敗し続けて run を手放す（`abandon`）ときも CANCEL は消さず、再起動の `recover` が `cancelled` を書く。thread / subprocess の両方で成り立つ。違反: cancel に 200 を返した job が、`failed`・`completed`・`paused` で終わる。
+- **INV-LC-4**: API が 200 で受け付けた cancel は失われず、再起動を越えても残る。受け付けは CANCEL file の書き込みが成功したときだけで、書けなければ cancel は 500 `CANCEL_NOT_PERSISTED` を返し、memory の flag も立てない（pause も同じで 500 `PAUSE_NOT_PERSISTED`）。それより後に書かれる終端は `cancelled` である（Q2: worker が先に結果を出していても `cancelled`。結果の sidecar は disk に残るが、workspace には結果を記録しない — `record_completion` は結果なしで呼ばれ、`current_job_id` はその job を指す）。terminal の書き込みが失敗し続けて run を手放す（`abandon`）ときも CANCEL は消さず、再起動の `recover` が `cancelled` を書く。thread / subprocess の両方で成り立つ。違反: cancel に 200 を返した job が、`failed`・`completed`・`paused` で終わる。
 - **INV-LC-5**: 失効した token による操作は捨てられ、ログに残る（`event='lifecycle.stale_commit_dropped'` / `lifecycle.stale_write_dropped` / `lifecycle.stale_frame_dropped` / `lifecycle.stale_outcome_dropped`）。対象は、status の書き込み、slot の解放、flag の消去、通知、結果と warning の書き込み、古い世代の outcome である。worker の progress と warning の frame（thread mode の callback、subprocess の JSONL の中継）は送る時点で token を確かめる: token の失効と frame の送信は同じ emit gate（`JobLifecycle._emit_gate`、lifecycle lock の内側の葉）を通るので、失効の後に frame は出ない。
 - **INV-LC-6**: reset が始まったあとは、それより前に取得された reset 世代の受付は通らない。reset 世代は `/fit`・`/tune` では予約と同じ lock の下、retune / resume では `create_child` と同じ lock の下、unpause では request の受信時に取得し、受付に引数で渡す（job の共有の欄には書かない）。
 
@@ -2580,7 +2580,7 @@ Workspace の `workspace_result` は完了時に自動更新される。
 | POST | `/api/jobs/{job_id}/export` | モデル/レポートを指定パスにExport |
 | GET | `/api/jobs/{job_id}/export-code` | LizyML 非依存コードを ZIP でダウンロード（H-0027） |
 | GET | `/api/jobs/{job_id}/log` | 実行ログ取得（H-0006） |
-| POST | `/api/jobs/{job_id}/cancel` | Running / Paused / Pending ジョブのキャンセル（H-0011 / P-0099 v3-20c / P-0119）。live な run には CANCEL を立てて 200（その run の終端は `cancelled`）、token の無い `pending` / `paused` は即座に `cancelled` に settle して 200、終端は 400 `JOB_NOT_RUNNING` |
+| POST | `/api/jobs/{job_id}/cancel` | Running / Paused / Pending ジョブのキャンセル（H-0011 / P-0099 v3-20c / P-0119）。live な run には CANCEL を立てて 200（その run の終端は `cancelled`）、token の無い `pending` / `paused` は即座に `cancelled` に settle して 200、終端は 400 `JOB_NOT_RUNNING`、CANCEL file を書けなければ 500 `CANCEL_NOT_PERSISTED`（受け付けない） |
 | POST | `/api/jobs/{job_id}/pause` | Running Tune を paused に遷移（次の trial 完了時）。Fit ジョブは `JOB_NOT_PAUSEABLE`、live な run が無い（`pending` / `paused` / 終端）か cancel が保留中なら `JOB_NOT_RUNNING`（P-0099 v3-20d / P-0119）。準備中の job も live な run なので受け付け、最初の callback で止まる |
 | POST | `/api/jobs/{job_id}/unpause` | Paused Tune を同 job_id で in-place 再開（Optuna `load_if_exists=True` で trial 継続）。data 再ロード必須。paused 以外は `JOB_NOT_PAUSED`、data 未読込は `WORKSPACE_NO_DATA`（P-0099 v3-20d）。継続できない study は起動前に `PICKLE_INCOMPATIBLE` で拒否し、job は paused のまま（P-0116 D4）。別の lizyml の major.minor で一時停止した job も同じく拒否する（checkpoint sidecar `model_meta.json` の `lizyml_version` で判定、P-0117 D3）。受付は join の前の CAS で、2 本目の並行 unpause は待たずに `JOB_NOT_PAUSED`、reset より古い unpause・受付後の join の失敗は 409 `JOB_CONFLICT`（job は `paused` に戻る、P-0119） |
 | POST | `/api/jobs/{job_id}/retune` | 完了 Tune を起点に再チューニング子ジョブを作成（H-0062） |
@@ -3023,6 +3023,8 @@ lizystudio_active_jobs 0.0
 | `JOB_NOT_RUNNING` | Cancel / Pause は running（または paused — Cancel のみ）job が対象 (P-0099 v3-20c/d) | 400 |
 | `JOB_NOT_PAUSEABLE` | Pause は tune job のみ対象（fit job は paused にできない）(P-0099 v3-20d) | 400 |
 | `JOB_NOT_PAUSED` | Unpause は paused job のみ対象 (P-0099 v3-20d) | 400 |
+| `CANCEL_NOT_PERSISTED` | cancel の CANCEL file を書けなかった。cancel は受け付けていない（P-0119 INV-LC-4） | 500 |
+| `PAUSE_NOT_PERSISTED` | pause の PAUSE file を書けなかった。pause は受け付けていない（P-0119） | 500 |
 
 > `LegacyFormatProtectionError`（§3.4.4 / P-0103）は専用エラーコードを持たず、`INTERNAL_ERROR` (500) として surface する。発生条件（旧 format_version の disk ファイル上書き）は通常運用では起きないため。recovery 手順は環境変数 `LIZYSTUDIO_ALLOW_LEGACY_WRITE=1`。
 

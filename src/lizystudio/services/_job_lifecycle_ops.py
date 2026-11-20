@@ -99,6 +99,9 @@ class LifecycleOps:
         - ``pending`` / ``paused`` without a token: settled ``cancelled`` now;
         - terminal: refused (``accepted`` False, the API answers 400).
 
+        Raises ``FlagNotPersistedError`` when the CANCEL file cannot be
+        written: the cancel is then not accepted (Codex r2-2).
+
         A ``running`` row without a live token is not reachable in this
         process (only admission writes ``running``, and every path that drops
         the token writes another status); for such a row the flag is set as
@@ -144,16 +147,16 @@ class LifecycleOps:
             return [self._settle_locked(job, "cancelled", None)]
 
     def force_release(self, job_id: str) -> LifecycleEffects | None:
-        """Revoke *job_id*'s run, write ``cancelled`` unless it is terminal,
-        and release its slot. CANCEL stays (a still-running child reads it)."""
+        """Write ``cancelled`` unless the row is terminal, then revoke
+        *job_id*'s run and release its slot. CANCEL stays (a still-running
+        child reads it).
+
+        The run keeps its authority until the ``cancelled`` write is
+        published (Codex r2-1): if the write raises, nothing is revoked or
+        released and the error propagates, so the run's own later commit can
+        still publish a terminal and settle the slot.
+        """
         with self.lock:
-            revoked = self._revoke_locked(job_id)
-            if revoked is not None:
-                _logger.warning(
-                    "event='lifecycle.force_release' job=%s run=%d",
-                    job_id,
-                    revoked.run_gen,
-                )
             job = self._meta.get(job_id)
             effects = None
             if job is not None and job.status not in TERMINAL_STATUSES:
@@ -164,6 +167,13 @@ class LifecycleOps:
                     status="cancelled", code=CANCELLED_CODE, message=CANCELLED_MESSAGE
                 )
                 effects = self._effects(job, outcome)
+            revoked = self._revoke_locked(job_id)
+            if revoked is not None:
+                _logger.warning(
+                    "event='lifecycle.force_release' job=%s run=%d",
+                    job_id,
+                    revoked.run_gen,
+                )
             self._slot.force_release_if(job_id)
             return effects
 
@@ -219,7 +229,9 @@ class LifecycleOps:
                 return False
             for job_id in job_ids:
                 if job_id in self._tokens:
-                    self._flags.request_cancel(job_id)
+                    # The directory is about to be removed: the flag only has
+                    # to reach the run (in-memory; its poll loop reads it).
+                    self._flags.mark_cancel_in_memory(job_id)
                     continue
                 self._slot.release(job_id)
                 self._flags.clear_cancel(job_id)
@@ -233,7 +245,7 @@ class LifecycleOps:
         with self.lock:
             self._started = True
 
-    def recover(self) -> None:
+    def recover(self) -> list[LifecycleEffects]:
         """Settle what a previous process left (INV-restart-1..3, P-0119 Q6).
 
         ``running`` / ``pending`` / ``paused`` rows with a CANCEL file become
@@ -241,40 +253,53 @@ class LifecycleOps:
         the newest CANCEL-less ``paused`` survivor gets the slot back (the
         others ``failed``). Terminal rows are never rewritten. Refused once
         :meth:`mark_started` ran.
+
+        Returns the effects of every terminal it published (one frame and one
+        terminal metric each, INV-LC-2; Codex r2-3). The caller emits them
+        once its broadcaster exists, so the frame is in the P-0093 replay
+        cache for a client that reconnects.
         """
         with self.lock:
             if self._started:
                 msg = "recover() is only allowed before the process starts"
                 raise RecoverRefusedError(msg)
-            paused = self._recover_rows_locked()
-            self._recover_paused_locked(paused)
+            effects: list[LifecycleEffects] = []
+            paused = self._recover_rows_locked(effects)
+            self._recover_paused_locked(paused, effects)
+            return effects
 
-    def _recover_rows_locked(self) -> list[Job]:
+    def _recover_rows_locked(self, effects: list[LifecycleEffects]) -> list[Job]:
         paused: list[Job] = []
         for job in self._meta.list():
             if job.status in TERMINAL_STATUSES:
                 continue
             if self._flags.is_cancel_requested(job.job_id):
-                self._recover_write_locked(job, "cancelled", None)
+                effects.append(self._recover_write_locked(job, "cancelled", None))
             elif job.status == "paused":
                 paused.append(job)
             else:
-                self._recover_write_locked(job, "failed", _RESTART_FAILED)
+                effects.append(
+                    self._recover_write_locked(job, "failed", _RESTART_FAILED)
+                )
         return paused
 
-    def _recover_paused_locked(self, paused: list[Job]) -> None:
+    def _recover_paused_locked(
+        self, paused: list[Job], effects: list[LifecycleEffects]
+    ) -> None:
         if not paused:
             return
         paused.sort(key=lambda j: j.created_at, reverse=True)
         survivor = paused[0]
         for job in paused[1:]:
-            self._recover_write_locked(job, "failed", _EXTRA_PAUSED)
+            effects.append(self._recover_write_locked(job, "failed", _EXTRA_PAUSED))
         self._slot.reattach(survivor.job_id)
         _logger.info(
             "Re-attached paused job %s to active slot at startup", survivor.job_id
         )
 
-    def _recover_write_locked(self, job: Job, status: str, error: str | None) -> None:
+    def _recover_write_locked(
+        self, job: Job, status: str, error: str | None
+    ) -> LifecycleEffects:
         _logger.warning(
             "Reconciling orphaned %s job %s to %s at startup",
             job.status,
@@ -284,6 +309,13 @@ class LifecycleOps:
         self._write_status_locked(job.job_id, status, error=error, completed_at=_now())
         self._flags.clear_cancel(job.job_id)
         self._flags.clear_pause(job.job_id)
+        if status == "cancelled":
+            outcome = Outcome(
+                status="cancelled", code=CANCELLED_CODE, message=CANCELLED_MESSAGE
+            )
+        else:
+            outcome = Outcome(status="failed", error=error, message=error)
+        return self._effects(job, outcome)
 
 
 def _now() -> str:

@@ -35,6 +35,7 @@ from lizystudio.api.errors import (
 )
 from lizystudio.backends.registry import get_adapter
 from lizystudio.metrics import MetricsRegistry
+from lizystudio.services._job_sinks import emit_effects
 from lizystudio.services._job_warnings import install_job_warning_hooks
 from lizystudio.services.jobs import JobStore
 from lizystudio.services.workspace import WorkspaceState
@@ -182,12 +183,17 @@ def create_app() -> FastAPI:
         # so the in-place /unpause contract survives restart.
         # P-0119: ``recover`` settles a CANCEL-marked row ``cancelled``
         # (Q6) and is closed by ``mark_started`` before any request runs.
-        application.state.job_store.recover()
+        recovered = application.state.job_store.recover()
         application.state.job_store.mark_started()
         _log_worker_mode()
         broadcaster = ProgressBroadcaster(metrics=metrics)
         broadcaster.set_loop(asyncio.get_running_loop())
         application.state.broadcaster = broadcaster
+        # P-0119 (Codex r2-3, INV-LC-2): each terminal ``recover`` published
+        # counts its metric once and its frame enters the P-0093 replay cache,
+        # now that the broadcaster exists.
+        for effects in recovered:
+            emit_effects(application.state.job_store, broadcaster, effects)
         yield
 
     application = FastAPI(

@@ -171,14 +171,14 @@ class JobStoreLifecycle:
 
     # --- Startup reconciliation (P-0099 v3-22a, P-0119 Q6) ---
 
-    def recover(self) -> None:
-        """See :meth:`LifecycleOps.recover`."""
-        self._lc.recover()
+    def recover(self) -> builtins.list[LifecycleEffects]:
+        """See :meth:`LifecycleOps.recover` (returns the effects to emit)."""
+        return self._lc.recover()
 
     def mark_started(self) -> None:
         """See :meth:`LifecycleOps.mark_started`."""
         self._lc.mark_started()
 
-    def reconcile_at_startup(self) -> None:
+    def reconcile_at_startup(self) -> builtins.list[LifecycleEffects]:
         """Alias of :meth:`recover`, kept for one release (P-0119)."""
-        self.recover()
+        return self.recover()

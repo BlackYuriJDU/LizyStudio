@@ -53,6 +53,7 @@ from lizystudio.backends.exceptions import (
 from lizystudio.backends.exceptions import (
     RefitRequiredError as _BackendRefitRequired,
 )
+from lizystudio.services._job_control_flags import FlagNotPersistedError
 from lizystudio.services._job_lifecycle_types import AdmissionRefused
 from lizystudio.services._job_sinks import emit_effects
 from lizystudio.services.export import export_code_as_zip, export_model, export_report
@@ -267,7 +268,11 @@ def cancel_job(
     ``JOB_NOT_RUNNING``. An accepted cancel survives a server restart.
     """
     _get_job_or_404(job_id, job_store)
-    result = job_store.cancel(job_id)
+    try:
+        result = job_store.cancel(job_id)
+    except FlagNotPersistedError as exc:
+        # P-0119 (Codex r2-2): no 200 without the durable CANCEL record.
+        raise StudioError("CANCEL_NOT_PERSISTED", str(exc), 500) from exc
     if not result.accepted:
         raise StudioError(
             "JOB_NOT_RUNNING",
@@ -304,7 +309,12 @@ def pause_job(
             f"Pause is only available on tune jobs (job_type: {job.job_type})",
             400,
         )
-    if not job_store.pause(job_id):
+    try:
+        accepted = job_store.pause(job_id)
+    except FlagNotPersistedError as exc:
+        # P-0119 (Codex r2-2): no 200 without the durable PAUSE record.
+        raise StudioError("PAUSE_NOT_PERSISTED", str(exc), 500) from exc
+    if not accepted:
         raise StudioError(
             "JOB_NOT_RUNNING",
             f"Pause requires a running job (status: {job.status})",
