@@ -5428,3 +5428,72 @@ BLUEPRINT の INV-1・INV-3・INV-5・INV-6・INV-restart-1 を、次の不変�
 - **Q4（新規の job の `running`）:** 受付の時点で `running` にしてよいか。あるいは `pending` のまま token だけを発行するか。
 - **Q5（delete）:** delete（`api/jobs.py:244-248`）の slot と flag の書き込みも、primitive に通すか（既定は通す。delete 後の復活は #626 に残す）。
 - **Q6（再起動の cancel）:** 再起動の前に cancel を受け付けていた job を、INV-restart-1 の `failed` ではなく `cancelled` にしてよいか（既定は `cancelled`）。
+
+
+### P-0120: Python の下限を 3.11 に上げる（Change Gate: 配布メタデータ・CI の必須 check）
+
+- **Date:** 2026-11-20 起票。同日、方向を owner が決めた（下の Decision）。
+- **Issue:** #775
+- **Related:** P-0113（toolchain の約束。「下限の 3.10 は EOL の後に別の議題で扱う」）、`pyproject.toml`、`.github/workflows/{ci,nightly}.yml`、GitHub Ruleset「Protect main」、`CONTRIBUTING.md` § Getting started、`README.md`
+
+Gate-category: none
+
+#### Motivation
+
+以下は develop `1275490` と、Nightly run 44636596516（2026-11-19）・43988540696（2026-11-17）の観察である。
+
+- Nightly の `backend (3.10)` は、観察した 2 回とも落ちた（11-17 の run 43988540696、11-19 の run 44636596516。どちらも develop に変更のあった夜）。変更のない夜は skip される。ほかの Python の脚は、どちらの run でも通った。落ちるのは 26 件で、0.15 と 0.20 の過去の job の互換テスト（`tests/integration/test_p0116_legacy_015_jobs.py`、`test_p0117_legacy_020_jobs.py`）に限られる。PR CI は integration を 3.12 でだけ走らせる（`ci.yml:164-177`）ので、PR では見えない。
+- **原因（再現済み）:**
+  - `uv.lock` は、Python 3.10 では pandas 2.3.3 に、3.11 以上では 3.0.1 に解決する（lizyml の依存、`python_full_version` の marker）。
+  - fixture は Python 3.12 の pandas 3 で撮った。そのモデルの `analysis_context` は、pandas 3 の文字列型を category に持つ値（`CategoricalDtype(..., categories_dtype=str)`）を pickle している。
+  - pandas 2.3.3 はこれを読めずに `NotImplementedError` を出し、lizyml が `DESERIALIZATION_FAILED` に包み、Studio は 500 `BACKEND_ERROR` を返す。
+  - 同じモデルは pandas 3.0.1 では読めて評価できる。いずれも Python 3.10 の環境（`uv sync --python 3.10 --frozen`）と 3.12 で確かめた。
+- これはテストだけの問題ではない。pandas 3 の文字列型を category に持つ値を含む job は、pandas 2 の環境では開けないことがある（確かめたのは fixture の 2 つの job。どちらも Python 3.12 で作った、`metadata.json` に記録あり）。すべての job が開けないとは確かめていない。
+- Python 3.10 は 2026-10 に EOL になった。P-0113 は、その後に下限を別に決めるとしていた。
+
+#### Purpose
+
+対応範囲から、lock した環境で pandas の major が分かれる版を外す。これで、開発と CI（`uv.lock` に従う環境）は、サポートするどの Python でも pandas 3 で job を読み書きする。pip で入れた利用者の環境は `uv.lock` に従わないので、この約束の外にある。そこまで揃えるかは、下の pandas の下限の論点で決める。根本の原因は pandas の major の分裂で、Python 3.10 の EOL がそれを外してよい理由である。
+
+#### 変更
+
+- **配布メタデータ:** `requires-python = ">=3.11"`。classifiers から 3.10 を外す。ruff の `target-version = "py311"`（`UP` の規則で出る機械的な書き換えも同じ PR で行う）。
+- **CI:**
+  - PR の backend matrix: `["3.11", "3.12"]`（下限と、その次の版。今と同じ形）。coverage は今と同じく両方の脚で測る（`ci.yml:114`）。ruff・format・mypy を 3.11 の脚だけで走らせる条件（`ci.yml:102-107`）も変えない。
+  - Nightly の backend matrix: `["3.11", "3.12", "3.13", "3.14"]`。
+- **GitHub Ruleset「Protect main」:** 必須 check の `backend (3.10)` を `backend (3.12)` に替える。matrix の変更と同時に行わないと、`backend (3.10)` が報告されなくなり、どの PR も merge できなくなる。Ruleset の変更は PR では表せないので、owner の承認を得て、PR の merge の直前に `gh api` で行う（変更前と変更後の必須 check の一覧を PR に記録する）。
+- **`uv.lock`:** `requires-python` に合わせて lock し直す。3.10 用の解決（pandas 2.3.3 など）が消えることだけを確かめ、3.11 以上の解決が変わらないことを diff で確かめる。
+- **文書とコメント:** `CONTRIBUTING.md` § Getting started（唯一の正本）と ruff の target の記述（`:148`）、`README.md`（`:77`、`:130`）、ROADMAP の P-0113 の行、`ci.yml` のコメント（`:61`、`:99`、`:158`）、`scripts/audit_stale_docs.py:92-94` の `>=3.10` の説明（時刻の正規化そのものは残してよい）。`.python-version` と `publish.yml` はすでに 3.12 で、変更は要らない。
+- **CHANGELOG:** Python 3.10 の利用者は 0.8.x に留まる、と upgrade note に書く。pip は 3.10 に新しい版を入れない。
+
+#### 範囲外（Decision の論点）
+
+- **pandas の下限:** Studio は pandas を直接は宣言していない。Python 3.11 以上でも、利用者の環境に pandas 2 が入れば同じ失敗が起きうる。`pandas>=3` を Studio の依存に足すかどうか。足せば pandas 2 を除外できるが、それで成果物の互換がすべて保証されるわけではない。依存の宣言を 1 つ増やす（Change Gate: 外部依存）。lizyml の側で決めるべきか、の判断も含む。
+- **読めない job の答え:** pandas の major の違いで読めないモデルは、今は 500 `BACKEND_ERROR` になる。理由つきの 4xx（例: 409 `MODEL_ARTIFACT_INVALID`、P-0117 D2）に変えるかどうか。
+
+#### Alternatives
+
+- **(B) 3.10 を維持し、読めない job を理由つきで拒否し、pandas 3 の fixture のテストは pandas 2 で skip する:** EOL の版のために、pandas の major の違いを扱う経路と skip を持ち続ける。
+- **(C) 3.10 を維持し、fixture を pandas 2 と 3 の 2 組持つ:** fixture の撮り直しの手間が倍になり、pandas 3 で作った job を pandas 2 で開けないことは変わらない。
+
+#### Compatibility
+
+- **利用者:** Python 3.10 では 0.9.0 以降を入れられない。0.8.x は 3.10 で引き続き動く。
+- **API・保存形式:** 変更なし。
+- **CI:** 必須 check の名前が 1 つ変わる（`backend (3.10)` → `backend (3.12)`）。
+
+#### Acceptance Criteria
+
+- [ ] `requires-python`、classifiers、ruff の `target-version`、PR と Nightly の matrix、CONTRIBUTING と README が 3.11〜3.14 で一致する。
+- [ ] `uv.lock` から 3.10 用の解決が消え、3.11 以上の解決の版が変わらない（`uv lock` の diff で確かめる）。
+- [ ] Ruleset の必須 check が `backend (3.11)`・`backend (3.12)` を含み、`backend (3.10)` を含まない。変更前と変更後の一覧が PR に記録されている。
+- [ ] merge の後で最初の、変更のある夜の Nightly で、backend の全脚が緑になる。0.15 と 0.20 の過去の job の互換テストが、3.11〜3.14 で通る。
+- [ ] CHANGELOG の upgrade note に、Python 3.10 の扱いが書かれている。
+
+#### Decision
+
+- **2026-11-20（owner）:** 下限を 3.11 に上げる（B・C は退けた）。0.9.0 で出す。
+- **2026-11-20（owner）、論点の結論:**
+  - pandas の下限は Studio に足さない。pandas の範囲は lizyml が決める。
+  - pandas の major の違いで読めない job への答えを理由つきの 4xx にする件は、別の Issue で扱う。P-0120 には含めない。
+  - Ruleset の必須 check の差し替えは、この PR の merge の直前に、Claude が `gh api` で行う。変更前と変更後の一覧を PR に記録し、ほかの設定は変えない。
