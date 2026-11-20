@@ -1,12 +1,15 @@
-"""Incremental reader of the subprocess progress JSONL file (Issue #87).
+"""The subprocess progress JSONL file: the child's writer and the parent's
+incremental reader (Issue #87).
 
 Moved out of :mod:`lizystudio.services.subprocess_runner` (P-0119, file
-size); re-exported there under its historical name.
+size); re-exported there under their historical names.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -104,3 +107,98 @@ class _ProgressReader:
             with contextlib.suppress(Exception):
                 self._file.close()
             self._file = None
+
+
+class _FileBroadcaster:
+    """A ProgressBroadcaster substitute that writes JSONL to a file.
+
+    Implements the same interface as ProgressBroadcaster so it can be
+    passed to ``run_fit`` / ``run_tune`` via the ``broadcaster`` kwarg.
+
+    P-0119 PR-B: the child's run sends only ``progress`` and ``warning``
+    lines through it. ``send_completed`` / ``send_error`` / ``send_paused``
+    stay for interface parity, but no child code path calls them any more
+    (the outcome file carries the result) and the parent does not relay
+    those line types; the parent's commit emits the frame.
+    """
+
+    def __init__(self, progress_path: str) -> None:
+        self._path = progress_path
+
+    def send_progress(
+        self,
+        job_id: str,
+        *,
+        current: int,
+        total: int,
+        message: str,
+        fold_results: list[dict[str, Any]] | None = None,
+        trial_results: list[dict[str, Any]] | None = None,
+    ) -> None:
+        msg: dict[str, Any] = {
+            "type": "progress",
+            "current": current,
+            "total": total,
+            "message": message,
+        }
+        if fold_results is not None:
+            msg["fold_results"] = fold_results
+        if trial_results is not None:
+            msg["trial_results"] = trial_results
+        _write_progress(self._path, msg)
+
+    def send_completed(self, job_id: str, message: str = "Completed.") -> None:
+        _write_progress(
+            self._path,
+            {"type": "completed", "message": message},
+        )
+
+    def send_error(
+        self,
+        job_id: str,
+        message: str,
+        code: str = "BACKEND_ERROR",
+    ) -> None:
+        _write_progress(
+            self._path,
+            {"type": "error", "message": message, "code": code},
+        )
+
+    def send_paused(
+        self,
+        job_id: str,
+        *,
+        trial_number: int | None = None,
+        message: str = "Paused.",
+    ) -> None:
+        """P-0099 v3-20e: WsPaused written to the JSONL stream.
+
+        The parent's ``_drain_progress_pipe`` re-reads the JSONL file
+        and forwards ``paused`` messages to the live broadcaster, which
+        in turn dispatches them to subscribed WS clients. Without this
+        method the subprocess child crashes with AttributeError when
+        ``_run_job_core`` catches ``PausedError`` and tries to notify.
+        """
+        msg: dict[str, Any] = {
+            "type": "paused",
+            "message": message,
+        }
+        if trial_number is not None:
+            msg["trial_number"] = trial_number
+        _write_progress(self._path, msg)
+
+    def send_warning(self, job_id: str, message: str) -> None:
+        """P-0117 D4: a stored job warning, written to the JSONL stream.
+
+        The parent's ``_forward_progress`` relays it to the live
+        broadcaster's ``send_warning``.
+        """
+        _write_progress(self._path, {"type": "warning", "message": message})
+
+
+def _write_progress(path: str, msg: dict[str, Any]) -> None:
+    """Append a JSON line to the progress file (fsync for atomicity)."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(msg) + "\n")
+        f.flush()
+        os.fsync(f.fileno())

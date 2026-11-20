@@ -310,7 +310,10 @@ def test_cleanup_runs_even_when_settling_the_job_raises(
     _join(ws)
 
     assert job_store.active_job_id is None
-    assert job_store.is_cancel_requested(job.job_id) is False
+    # Codex r1-3 (INV-LC-4 / Q6): no terminal was published, so the accepted
+    # cancel stays durable (a restart's recover writes ``cancelled``); only
+    # PAUSE is cleared. Before this fix the abandon cleared CANCEL too.
+    assert job_store.is_cancel_requested(job.job_id) is True
     assert job_store.is_pause_requested(job.job_id) is False
     broadcaster.send_error.assert_not_called()
 

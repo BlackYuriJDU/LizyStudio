@@ -105,7 +105,10 @@ def _make_cancel_aware_cb(
             raise CancelledError
         if job_store.is_pause_requested(job_id):
             raise PausedError
-        if broadcaster is not None:
+        if broadcaster is None:
+            return
+
+        def send() -> None:
             broadcaster.send_progress(
                 job_id,
                 current=current,
@@ -114,6 +117,15 @@ def _make_cancel_aware_cb(
                 fold_results=extra.get("fold_results"),
                 trial_results=extra.get("trial_results"),
             )
+
+        if token is None:
+            # The subprocess child: its frames go to the JSONL relay, which
+            # the parent fences by the run token before forwarding them.
+            send()
+        elif not job_store.emit_if_live(token, send):
+            # Revoked after the checks above (Codex r1-4): no frame, and the
+            # worker stops at this cooperative point.
+            raise CancelledError
 
     return callback
 
@@ -248,8 +260,8 @@ def _run_job_core(
     The core neither claims the slot nor writes ``running``: admission did
     both before the worker started. It runs *execute_fn* under captured
     logging and warnings, then hands the outcome to *sink* — the parent's
-    primitive in thread mode (:class:`ParentCommitSink`), the legacy child
-    writer in the subprocess child (:class:`LegacyChildStatusSink`). The
+    primitive in thread mode (:class:`ParentCommitSink`), the outcome file
+    in the subprocess child (:class:`ChildOutcomeSink`, P-0119 PR-B). The
     slot, the flags and the terminal metric are settled by that commit, not
     here. *job*'s lifecycle fields mirror the committed row on return.
     """
@@ -266,6 +278,7 @@ def _run_job_core(
             broadcaster=broadcaster,
             job_logger=logging.getLogger(f"lizystudio.training.{job.job_id}"),
             token=sink.token,
+            persist=sink.persists_warnings,
         )
         try:
             # P-0119: test-only child barrier, outside the outcome mapping, so a

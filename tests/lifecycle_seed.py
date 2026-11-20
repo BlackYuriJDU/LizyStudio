@@ -9,10 +9,13 @@ writer, so the src status-writer census stays clean.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
-from lizystudio.services._job_lifecycle_types import RunToken
+from lizystudio.services._job_lifecycle_types import Outcome, RunToken
 from lizystudio.services._job_metadata import Job
+from lizystudio.services._job_outcome_file import write_outcome
 from lizystudio.services._job_sinks import ParentCommitSink
 from lizystudio.services.jobs import JobStore
 
@@ -78,16 +81,21 @@ def fake_child_exit(
     monkeypatch: Any, *, status: str | None, returncode: int = 0
 ) -> None:
     """Replace the child's launch and wait (``_supervise_child``) with an
-    exit that persisted *status* (``None``: the child died without writing
-    one) and returned *returncode*. The parent's real reconcile — the commit
-    of the run token — then runs on that row (P-0119)."""
+    exit whose outcome file reports *status* (``None``: the child died
+    without one) and that returned *returncode*. The parent's real reconcile
+    — the commit of the run token — then publishes it (P-0119 PR-B)."""
 
-    def supervise(*, job: Job, job_store: JobStore, **_: Any) -> int:
+    def supervise(*, job: Job, job_store: JobStore, args_path: str, **_: Any) -> int:
         if status is not None:
-            stored = job_store.get(job.job_id)
-            assert stored is not None
-            stored.status = status  # type: ignore[assignment]
-            seed_job(job_store, stored)
+            run_gen = json.loads(Path(args_path).read_text())["run_gen"]
+            write_outcome(
+                job_store.path_for(job.job_id, "outcome"),
+                run_gen=run_gen,
+                outcome=Outcome(status=status),  # type: ignore[arg-type]
+                fit_result=None,
+                tune_result=None,
+                model_path=None,
+            )
         return returncode
 
     monkeypatch.setattr(

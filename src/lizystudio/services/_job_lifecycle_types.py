@@ -59,18 +59,12 @@ class RunToken:
 
 @dataclass(frozen=True)
 class Outcome:
-    """What a worker (or the reconcile of a dead child) asks to commit.
-
-    ``adopted`` marks a status the legacy subprocess child already wrote and
-    announced (``LegacyChildStatusSink``, removed by PR-B): the commit then
-    settles the token, slot, flags and metric without a second write or frame.
-    """
+    """What a worker (or the reconcile of a dead child) asks to commit."""
 
     status: OutcomeStatus
     error: str | None = None
     code: str | None = None
     message: str | None = None
-    adopted: bool = False
 
 
 @dataclass(frozen=True)

@@ -11,11 +11,11 @@ from __future__ import annotations
 import builtins
 import logging
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services._job_lifecycle_types import (
-    TERMINAL_STATUSES,
     CancelResult,
     ExpectedStatus,
     LifecycleEffects,
@@ -165,22 +165,9 @@ class JobStoreLifecycle:
             self._meta.update(job)
             return True
 
-    def legacy_child_write_status(
-        self, job_id: str, status: str, *, error: str | None, completed_at: str | None
-    ) -> bool:
-        """``LegacyChildStatusSink`` only (the subprocess child, until PR-B).
-
-        Writes *status* over a non-terminal on-disk row; never ``running``,
-        never flags or the slot. The parent then adopts it with one commit.
-        """
-        with self._lc.lock:
-            current = self._meta.get(job_id)
-            if current is None or current.status in TERMINAL_STATUSES:
-                return False
-            self._meta.write_status_locked(
-                job_id, status, error=error, completed_at=completed_at
-            )
-            return True
+    def emit_if_live(self, token: RunToken, send: Callable[[], None]) -> bool:
+        """See :meth:`JobLifecycle.emit_if_live` (the token-fenced frame)."""
+        return self._lc.emit_if_live(token, send)
 
     # --- Startup reconciliation (P-0099 v3-22a, P-0119 Q6) ---
 

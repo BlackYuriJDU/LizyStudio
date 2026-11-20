@@ -10,6 +10,8 @@ subprocess retune slot. Thread mode unless a test says otherwise.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,7 +19,8 @@ import pytest
 from lizystudio.api import jobs as jobs_api
 from lizystudio.api import workspace as ws_api
 from lizystudio.services import subprocess_runner, training
-from lizystudio.services._job_metadata import read_job_json, write_job_json
+from lizystudio.services._job_lifecycle_types import Outcome
+from lizystudio.services._job_outcome_file import write_outcome
 from tests.regression.p0119_harness import (
     Call,
     Env,
@@ -236,12 +239,18 @@ def test_subprocess_retune_holds_the_parent_slot(
     parent_id = _seed_completed_tune_parent(env)
     gate = Gate()
 
-    def fake_supervise(*, job: Any, job_store: Any, **_: Any) -> int:
+    def fake_supervise(*, job: Any, job_store: Any, args_path: str, **_: Any) -> int:
+        # The child's run: held, then it reports ``completed`` in its outcome
+        # file (P-0119 PR-B: the child writes no status).
         gate.hold()
-        meta = job_store.path_for(job.job_id, "meta")
-        payload = read_job_json(meta)
-        payload["status"] = "completed"
-        write_job_json(meta, payload)
+        write_outcome(
+            job_store.path_for(job.job_id, "outcome"),
+            run_gen=json.loads(Path(args_path).read_text())["run_gen"],
+            outcome=Outcome(status="completed"),
+            fit_result=None,
+            tune_result=None,
+            model_path=None,
+        )
         return 0
 
     monkeypatch.setattr(subprocess_runner, "_supervise_child", fake_supervise)

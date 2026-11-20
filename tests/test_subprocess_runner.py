@@ -688,13 +688,18 @@ class TestForwardProgress:
         assert kwargs["trial_results"] == [{"trial": 0, "value": 0.8}]
 
     def test_completed_and_error_dispatch(self) -> None:
+        """Overturned by P-0119 (子: "親は、子の終端の frame を転送しない"):
+        the child's ``completed`` / ``error`` lines are not relayed; the
+        parent's commit of the child's outcome emits the one terminal frame.
+        Before P-0119 they were forwarded to ``send_completed`` / ``send_error``.
+        """
         b = MagicMock()
         _forward_progress('{"type": "completed"}', "job-1", b)
-        b.send_completed.assert_called_once_with("job-1")
         _forward_progress(
             '{"type": "error", "message": "bad", "code": "FIT_ERROR"}', "job-1", b
         )
-        b.send_error.assert_called_once_with("job-1", "bad", code="FIT_ERROR")
+        assert b.send_completed.call_count == 0
+        assert b.send_error.call_count == 0
 
     def test_paused_dispatch_forwards_to_send_paused(self) -> None:
         """P-0099 v3-20e regression — the JSONL line ``{"type":
@@ -703,6 +708,10 @@ class TestForwardProgress:
         parent broadcaster's ``send_paused`` so WS subscribers see the
         transition. The CI failure for PR #427 traced to this missing
         case in ``_forward_progress``.
+
+        Overturned by P-0119 (子: the ``paused`` frame is not forwarded): the
+        parent's ``paused`` commit of the child's outcome sends the one
+        ``WsPaused`` frame instead.
         """
         b = MagicMock()
         _forward_progress(
@@ -710,9 +719,7 @@ class TestForwardProgress:
             "job-1",
             b,
         )
-        b.send_paused.assert_called_once_with(
-            "job-1", trial_number=5, message="Paused."
-        )
+        assert b.send_paused.call_count == 0
 
 
 # ---------------------------------------------------------------------------

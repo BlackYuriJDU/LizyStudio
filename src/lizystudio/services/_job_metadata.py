@@ -65,6 +65,7 @@ ArtifactKind = Literal[
     "tuning_plot",
     "cancel_flag",
     "pause_flag",
+    "outcome",
 ]
 
 ARTIFACT_FILENAMES: dict[ArtifactKind, str] = {
@@ -76,6 +77,8 @@ ARTIFACT_FILENAMES: dict[ArtifactKind, str] = {
     "tuning_plot": "tuning_plot.json",
     "cancel_flag": CANCEL_FLAG_FILENAME,
     "pause_flag": PAUSE_FLAG_FILENAME,
+    # P-0119 PR-B: the subprocess child's outcome, read by the parent.
+    "outcome": "outcome.json",
 }
 
 

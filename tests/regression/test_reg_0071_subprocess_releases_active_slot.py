@@ -75,8 +75,9 @@ def test_subprocess_job_releases_slot_on_success(
     job = _make_claimed_job(job_store)
     assert job_store.active_job_id == job.job_id
 
-    # P-0119: the child persists ``completed`` and exits 0; the parent adopts
-    # it with one commit of the run token, which releases the slot.
+    # P-0119: the child reports ``completed`` in its outcome file and exits
+    # 0; the parent publishes it with one commit of the run token, which
+    # releases the slot.
     fake_child_exit(monkeypatch, status="completed", returncode=0)
 
     training_module._run_subprocess_job(

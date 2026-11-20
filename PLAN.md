@@ -1511,16 +1511,17 @@ v2 で構築した基盤の上に、Widget 運用知見の移植・UX 改善・�
 
 ## Phase v3-27: P-0119 — job lifecycle transition primitive（Issue #613 / #697）
 
-HISTORY P-0119（2026-11-20 accepted, Option A; Q1 は重なりを受け入れ、Q2〜Q6 は既定）。job の status・cancel / pause flag・active slot・run token・lifecycle の reset 世代を、親の `JobStore` の 1 つの lock の下の遷移 primitive（`services/_job_lifecycle.py`）でだけ動かす。2 PR に分け、どちらも `develop` を base にする（#613 の 2026-11-20 のコメント）。PR-A と PR-B の間には release しない。
+HISTORY P-0119（2026-11-20 accepted, Option A; Q1 は重なりを受け入れ、Q2〜Q6 は既定）。job の status・cancel / pause flag・active slot・run token・lifecycle の reset 世代を、親の `JobStore` の 1 つの lock の下の遷移 primitive（`services/_job_lifecycle.py`）でだけ動かす。当初は 2 PR に分ける計画だったが、PR #768 の CI（subprocess mode の e2e）で、PR-A 単独では子の status の書き込みが親の commit より先に見えて unpause / retune が 409 になることが分かり、PR-B を同じ PR に入れた（2026-11-20、#768）。
 
 | サブフェーズ | 内容 | 状態 | PR |
 |---|---|---|---|
-| v3-27a (PR-A) | primitive（admit / start / commit / abort / settle / cancel / pause / reset / force_release / recover）と、親側のすべての書き手の付け替え。`update()` は status-free。子は `LegacyChildStatusSink` に限定（`running` は書かない、flag と slot に触れない）。retune / resume の受付は slot が他の job に取られていれば 409 `JOB_CONFLICT`。`pending -> failed` を合法化。Q2 で cancel が勝つと sidecar は残し、workspace には結果を記録しない。完了は結果を status-free に書いてから status を commit | 🟡 実装済み（review 待ち） | — |
-| v3-27b (PR-B) | 子は status を書かず、run 世代つきの outcome file を書く。親は世代の一致する outcome だけを commit。`LegacyChildStatusSink` と子の終端 frame の転送を削除 | ⬜ | — |
+| v3-27a (PR-A) | primitive（admit / start / commit / abort / settle / cancel / pause / reset / force_release / recover）と、親側のすべての書き手の付け替え。`update()` は status-free。子は 子の暫定の status writer に限定（`running` は書かない、flag と slot に触れない）。retune / resume の受付は slot が他の job に取られていれば 409 `JOB_CONFLICT`。`pending -> failed` を合法化。Q2 で cancel が勝つと sidecar は残し、workspace には結果を記録しない。完了は結果を status-free に書いてから status を commit | 🟡 実装済み（review 中） | #768 |
+| v3-27b (PR-B) | 子は status を書かず、run 世代つきの outcome file を書く。親は世代の一致する outcome だけを commit。子の暫定の status writer と子の終端 frame の転送を削除 | 🟡 実装済み（#768 に同梱） | #768 |
 
-**受け入れ（P-0119 Acceptance Criteria の 21 項目）:** PR-A で 16（Race A・Race B・窓1・窓4・pause・launch の失敗・reset と予約・再起動・#697 窓1・#697 窓2・窓2・subprocess の retune の slot・#765 の片割れ・競合する commit・互換 2 件）、PR-B で 5（窓3 の両 mode・通知・古い outcome・fence を外す確認・status の書き手の census）。
+**受け入れ（P-0119 Acceptance Criteria の 21 項目）:** PR-A の範囲で 16（Race A・Race B・窓1・窓4・pause・launch の失敗・reset と予約・再起動・#697 窓1・#697 窓2・窓2・subprocess の retune の slot・#765 の片割れ・競合する commit・互換 2 件）、PR-B で 5（窓3 の両 mode・通知・古い outcome・fence を外す確認・status の書き手の census）。
 
-**DoD (PR-A):**
+**DoD (#768 = PR-A + PR-B):**
+- [x] PR-B の項目（窓3 の両 mode・通知・古い outcome・fence を外す確認・status の書き手の census）と、CI の e2e の回帰（unpause / retune の 409）を `tests/regression/test_reg_0613_prb_child_outcome.py` などで再現してから直した
 - [x] P-0119 の PR-A 項目のテスト（`tests/regression/test_reg_0613_*.py`、`test_reg_0697_child_windows.py`）が緑。先に develop に対して RED を取った
 - [x] 既存テストの期待の変更は P-0119 を引用して書き直した（削除なし）
 - [x] `pnpm generate:api` の差分が空（API の形は不変）

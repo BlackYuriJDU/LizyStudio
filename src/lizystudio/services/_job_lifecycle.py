@@ -48,6 +48,7 @@ from lizystudio.services._job_lifecycle_types import (
     SlotRule,
 )
 from lizystudio.services._job_metadata import Job, JobMetadataStore
+from lizystudio.services._job_outcome_file import remove_outcome
 
 _logger = logging.getLogger(__name__)
 
@@ -73,6 +74,12 @@ class JobLifecycle(LifecycleOps):
         self._last_run_gen = 0
         self._reset_gen = 0
         self._started = False
+        # INV-LC-5 for notifications: every token removal and every
+        # token-fenced frame take this gate, so a frame is either sent while
+        # its run is live or dropped. Lock order: ``lock`` -> ``_emit_gate``;
+        # an emitter takes only the gate (never ``lock``), so a broadcast is
+        # never made under the lifecycle lock.
+        self._emit_gate = threading.Lock()
 
     # --- reset generation and reservations -----------------------------
 
@@ -137,7 +144,7 @@ class JobLifecycle(LifecycleOps):
     ) -> AdmissionReason | None:
         """The admission preconditions, in their order (a test seam: it runs
         under the lock, so holding it here holds every lifecycle operation)."""
-        if reset_gen != self._reset_gen:
+        if not self._same_reset_gen_locked(reset_gen):
             return "reset_gen"
         if job is None or job.status != expect:
             return "status"
@@ -155,6 +162,7 @@ class JobLifecycle(LifecycleOps):
         if slot_rule == "claim":
             self._slot.claim(job.job_id)
         self._flags.clear_pause(job.job_id)
+        remove_outcome(self._meta.path_for(job.job_id, "outcome"))
         self._last_run_gen += 1
         origin: ExpectedStatus = "paused" if job.status == "paused" else "pending"
         token = RunToken(job.job_id, self._last_run_gen, origin)
@@ -189,7 +197,18 @@ class JobLifecycle(LifecycleOps):
             return self._is_live_locked(token)
 
     def _is_live_locked(self, token: RunToken) -> bool:
+        """The token fence (INV-LC-5): *token* is its job's live run token."""
         return self._tokens.get(token.job_id) == token
+
+    def _same_reset_gen_locked(self, reset_gen: int) -> bool:
+        """The generation fence (INV-LC-6): no reset since *reset_gen*."""
+        return reset_gen == self._reset_gen
+
+    def _revoke_locked(self, job_id: str) -> RunToken | None:
+        """Remove *job_id*'s token (caller holds ``lock``), through the emit
+        gate so no fenced frame of that run is in flight."""
+        with self._emit_gate:
+            return self._tokens.pop(job_id, None)
 
     # --- commit and abort ----------------------------------------------
 
@@ -215,9 +234,8 @@ class JobLifecycle(LifecycleOps):
             return None
         job = self._meta.load_job(token.job_id)
         final = self._resolve_locked(job, outcome)
-        if not (final.adopted and final.status == job.status):
-            self._write_outcome_locked(job, final)
-        del self._tokens[token.job_id]
+        self._write_outcome_locked(job, final)
+        self._revoke_locked(token.job_id)
         self._settle_flags_and_slot_locked(job.job_id, final.status)
         return self._effects(job, final)
 
@@ -230,12 +248,10 @@ class JobLifecycle(LifecycleOps):
 
     def _resolve_locked(self, job: Job, outcome: Outcome) -> Outcome:
         """Apply the priorities: an accepted cancel wins over every other
-        outcome (Q2, INV-LC-4); a legacy child's terminal stays adopted."""
+        outcome (Q2, INV-LC-4)."""
         if not self._flags.is_cancel_requested(job.job_id):
             return outcome
         if outcome.status == "cancelled":
-            return outcome
-        if outcome.adopted and outcome.status in TERMINAL_STATUSES:
             return outcome
         return Outcome(
             status="cancelled", code=CANCELLED_CODE, message=CANCELLED_MESSAGE
@@ -314,12 +330,10 @@ class JobLifecycle(LifecycleOps):
     @staticmethod
     def _effects(job: Job, outcome: Outcome) -> LifecycleEffects:
         status = outcome.status
-        if outcome.adopted and status != "paused":
-            frame = None
-        elif status == "completed":
+        if status == "completed":
             frame = "completed"
         elif status == "paused":
-            frame = None if outcome.adopted else "paused"
+            frame = "paused"
         else:
             frame = "error"
         metric = status if status in TERMINAL_STATUSES else None

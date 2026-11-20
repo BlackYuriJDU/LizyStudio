@@ -26,8 +26,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lizystudio.services._job_lifecycle_types import Outcome, RunToken
-from lizystudio.services._job_sinks import LegacyChildStatusSink, emit_effects
-from lizystudio.services._progress_reader import _ProgressReader
+from lizystudio.services._job_outcome_file import read_outcome, remove_outcome
+from lizystudio.services._job_sinks import ChildOutcomeSink, emit_effects
+from lizystudio.services._progress_reader import (  # noqa: F401 — re-exports
+    _FileBroadcaster,
+    _ProgressReader,
+    _write_progress,
+)
 from lizystudio.services._training_core import _subprocess_duration_seconds
 from lizystudio.services.jobs import Job, JobStore
 
@@ -165,11 +170,13 @@ def run_job_in_subprocess(
         retune_expand_boundary=retune_expand_boundary,
         retune_boundary_threshold=retune_boundary_threshold,
         resume_from_existing_study=resume_from_existing_study,
+        run_gen=token.run_gen,
     )
+    relay: Any = _FencedRelay(broadcaster, job, job_store, token)
     returncode = _supervise_child(
         job=job,
         job_store=job_store,
-        broadcaster=broadcaster,
+        broadcaster=relay,
         args_path=args_path,
         progress_path=progress_path,
     )
@@ -194,6 +201,7 @@ def _write_child_args(
     retune_expand_boundary: bool | None,
     retune_boundary_threshold: float | None,
     resume_from_existing_study: bool = False,
+    run_gen: int = 0,
 ) -> tuple[str, str]:
     """Serialize the child's launch arguments to a temp JSON file.
 
@@ -215,6 +223,8 @@ def _write_child_args(
         "job_type": job.job_type,
         "mode": mode,
         "resume_from_existing_study": resume_from_existing_study,
+        # P-0119 PR-B: the run generation the child tags its outcome with.
+        "run_gen": run_gen,
     }
     if mode == "retune":
         if parent_job_id is None:
@@ -331,44 +341,108 @@ def _reconcile_subprocess_result(
     returncode: int | None,
     token: RunToken,
 ) -> Job:
-    """Commit the exited child's result through the parent's primitive.
+    """Publish the exited child's outcome through the parent's primitive.
 
-    P-0119: the reconcile is one ``commit`` of the run's *token*, under the
-    lifecycle lock, so a concurrent cancel sees either the run before it or
-    its terminal after it (窓4). Two cases:
+    P-0119 (PR-B): the child wrote no status — only ``outcome.json``, tagged
+    with its run generation. The reconcile reads it and makes one ``commit``
+    of the run's *token*, under the lifecycle lock, so the status becomes
+    visible only now and a concurrent cancel sees either the run before it or
+    its terminal after it (窓4):
 
-    - the child persisted ``paused`` or a terminal (``LegacyChildStatusSink``,
-      PR-A): the parent **adopts** it — token, slot, flags and the one metric
-      are settled, and no second frame is sent (the child's frame was already
-      forwarded);
-    - the child died with the row still ``running`` (Cancel -> SIGTERM, a hard
-      kill, a crash in setup): ``failed`` is committed, which becomes
-      ``cancelled`` when a cancel was accepted (INV-LC-4).
+    - an outcome of this run: its results are written status-free, then its
+      status is committed (an accepted cancel wins, Q2);
+    - no outcome (Cancel -> SIGTERM, a hard kill, a crash in setup) or a
+      stale one (another run's generation, discarded and logged): ``failed``
+      is committed, which becomes ``cancelled`` when a cancel was accepted.
 
     *returncode* is :func:`_supervise_child`'s return value; it appears in
     the "without persisting a terminal status" error message.
     """
-    updated = job_store.get(job.job_id)
-    if updated is None:
+    if job_store.get(job.job_id) is None:
         # The job directory is gone (deleted while it ran): drop the run.
         job_store.abandon(token)
         job.status = "failed"
         job.error = "Subprocess did not persist job result"
         return job
-    if updated.status in ("pending", "running"):
-        failure = (
-            f"Subprocess exited with code {returncode} "
-            f"without persisting a terminal status"
-        )
-        outcome = Outcome(status="failed", error=failure, message=failure)
-    else:
-        outcome = Outcome(status=updated.status, adopted=True)  # type: ignore[arg-type]
+    outcome = _child_outcome(job, job_store, token, returncode)
     effects = job_store.commit(token, outcome)
-    latest = job_store.get(job.job_id) or updated
+    latest = job_store.get(job.job_id) or job
     emit_effects(
         job_store, broadcaster, effects, duration=_subprocess_duration_seconds(latest)
     )
     return latest
+
+
+def _child_outcome(
+    job: Job, job_store: JobStore, token: RunToken, returncode: int | None
+) -> Outcome:
+    """Read (and remove) the child's outcome file; apply this run's results."""
+    path = job_store.path_for(job.job_id, "outcome")
+    child = read_outcome(path)
+    remove_outcome(path)
+    if child is not None and _same_run(child.run_gen, token):
+        if child.outcome.status == "completed":
+            job.fit_result = child.fit_result
+            job.tune_result = child.tune_result
+            job.model_path = child.model_path
+            job_store.write_results(job, token)
+        return child.outcome
+    if child is not None:
+        _logger.warning(
+            "event='lifecycle.stale_outcome_dropped' job=%s outcome_run=%d live_run=%d",
+            job.job_id,
+            child.run_gen,
+            token.run_gen,
+        )
+    failure = (
+        f"Subprocess exited with code {returncode} without persisting a terminal status"
+    )
+    return Outcome(status="failed", error=failure, message=failure)
+
+
+def _same_run(outcome_gen: int, token: RunToken) -> bool:
+    """The outcome fence (INV-LC-5): the outcome is the live run's."""
+    return outcome_gen == token.run_gen
+
+
+class _FencedRelay:
+    """The parent's view of the child's JSONL frames (P-0119 PR-B).
+
+    Progress and warning frames are forwarded only while the run's token is
+    live (INV-LC-5); a relayed warning is persisted by the parent, under the
+    token, because the child writes no ``meta.json``. Terminal and paused
+    frames are not relayed: the parent's commit emits them.
+    """
+
+    def __init__(
+        self,
+        broadcaster: ProgressBroadcaster | None,
+        job: Job,
+        job_store: JobStore,
+        token: RunToken,
+    ) -> None:
+        self._broadcaster = broadcaster
+        self._job = job
+        self._job_store = job_store
+        self._token = token
+
+    def send_progress(self, job_id: str, **kwargs: Any) -> None:
+        broadcaster = self._broadcaster
+        if broadcaster is not None:
+            self._job_store.emit_if_live(
+                self._token, lambda: broadcaster.send_progress(job_id, **kwargs)
+            )
+
+    def send_warning(self, job_id: str, text: str) -> None:
+        if text not in self._job.warnings:
+            self._job.warnings = [*self._job.warnings, text]
+            if not self._job_store.write_results(self._job, self._token):
+                return
+        broadcaster = self._broadcaster
+        if broadcaster is not None:
+            self._job_store.emit_if_live(
+                self._token, lambda: broadcaster.send_warning(job_id, text)
+            )
 
 
 def _poll_progress(
@@ -468,25 +542,18 @@ def _forward_progress(
         if trial_results is not None:
             kwargs["trial_results"] = trial_results
         broadcaster.send_progress(job_id, **kwargs)
-    elif msg_type == "completed":
-        broadcaster.send_completed(job_id)
-    elif msg_type == "error":
-        broadcaster.send_error(
+    elif msg_type in ("completed", "error", "paused"):
+        # P-0119 PR-B: not relayed. The parent's commit of the child's
+        # outcome emits the one terminal / paused frame (INV-LC-2).
+        _logger.info(
+            "event='subprocess.terminal_frame_not_relayed' job=%s type=%s message=%s",
             job_id,
-            msg.get("message", "Unknown error"),
-            code=msg.get("code", "BACKEND_ERROR"),
-        )
-    elif msg_type == "paused":
-        # P-0099 v3-20e: forward the child's paused notification to
-        # live WS subscribers via the parent's ProgressBroadcaster.
-        broadcaster.send_paused(
-            job_id,
-            trial_number=msg.get("trial_number"),
-            message=msg.get("message", "Paused."),
+            msg_type,
+            msg.get("message"),
         )
     elif msg_type == "warning":
-        # P-0117 D4: a warning the child's job stored; the child already
-        # persisted it on the job, so this hop only feeds live subscribers.
+        # P-0117 D4: a warning the child raised. The child writes no
+        # ``meta.json``; the parent's relay persists it, then broadcasts.
         text = msg.get("message")
         if not isinstance(text, str) or not text:
             _logger.warning(
@@ -602,7 +669,8 @@ def _child_dispatch(
     dataframe: Any,
     progress_path: str,
 ) -> None:
-    """Run the child's job (fit / tune / retune) with the legacy sink."""
+    """Run the child's job (fit / tune / retune); its outcome goes to the
+    outcome file (P-0119 PR-B), never to ``meta.json``."""
     config: dict[str, Any] = args["config"]
     job_type: str = args["job_type"]
     mode: str = args.get("mode", "job")
@@ -613,9 +681,9 @@ def _child_dispatch(
 
     # _FileBroadcaster is duck-type compatible with ProgressBroadcaster
     broadcaster_any: Any = file_broadcaster
-    # P-0119 (PR-A): the child's one status writer; PR-B replaces it with an
-    # outcome file the parent commits.
-    sink = LegacyChildStatusSink(job_store, broadcaster_any)
+    # P-0119 PR-B: the child writes only the outcome file, tagged with the
+    # run generation the parent's admission issued.
+    sink = ChildOutcomeSink(job_store, int(args.get("run_gen", 0)))
 
     if mode == "retune":
         _child_retune(
@@ -661,7 +729,7 @@ def _child_retune(
     dataframe: Any,
     progress_path: str,
     broadcaster: Any,
-    sink: LegacyChildStatusSink,
+    sink: ChildOutcomeSink,
 ) -> None:
     """The child's Re-tune run (H-0062 Bugfix 2026-04-14)."""
     from lizystudio.services.training import run_retune
@@ -688,95 +756,6 @@ def _child_retune(
         broadcaster=broadcaster,
         sink=sink,
     )
-
-
-class _FileBroadcaster:
-    """A ProgressBroadcaster substitute that writes JSONL to a file.
-
-    Implements the same interface as ProgressBroadcaster so it can be
-    passed to ``run_fit`` / ``run_tune`` via the ``broadcaster`` kwarg.
-    """
-
-    def __init__(self, progress_path: str) -> None:
-        self._path = progress_path
-
-    def send_progress(
-        self,
-        job_id: str,
-        *,
-        current: int,
-        total: int,
-        message: str,
-        fold_results: list[dict[str, Any]] | None = None,
-        trial_results: list[dict[str, Any]] | None = None,
-    ) -> None:
-        msg: dict[str, Any] = {
-            "type": "progress",
-            "current": current,
-            "total": total,
-            "message": message,
-        }
-        if fold_results is not None:
-            msg["fold_results"] = fold_results
-        if trial_results is not None:
-            msg["trial_results"] = trial_results
-        _write_progress(self._path, msg)
-
-    def send_completed(self, job_id: str, message: str = "Completed.") -> None:
-        _write_progress(
-            self._path,
-            {"type": "completed", "message": message},
-        )
-
-    def send_error(
-        self,
-        job_id: str,
-        message: str,
-        code: str = "BACKEND_ERROR",
-    ) -> None:
-        _write_progress(
-            self._path,
-            {"type": "error", "message": message, "code": code},
-        )
-
-    def send_paused(
-        self,
-        job_id: str,
-        *,
-        trial_number: int | None = None,
-        message: str = "Paused.",
-    ) -> None:
-        """P-0099 v3-20e: WsPaused written to the JSONL stream.
-
-        The parent's ``_drain_progress_pipe`` re-reads the JSONL file
-        and forwards ``paused`` messages to the live broadcaster, which
-        in turn dispatches them to subscribed WS clients. Without this
-        method the subprocess child crashes with AttributeError when
-        ``_run_job_core`` catches ``PausedError`` and tries to notify.
-        """
-        msg: dict[str, Any] = {
-            "type": "paused",
-            "message": message,
-        }
-        if trial_number is not None:
-            msg["trial_number"] = trial_number
-        _write_progress(self._path, msg)
-
-    def send_warning(self, job_id: str, message: str) -> None:
-        """P-0117 D4: a stored job warning, written to the JSONL stream.
-
-        The parent's ``_forward_progress`` relays it to the live
-        broadcaster's ``send_warning``.
-        """
-        _write_progress(self._path, {"type": "warning", "message": message})
-
-
-def _write_progress(path: str, msg: dict[str, Any]) -> None:
-    """Append a JSON line to the progress file (fsync for atomicity)."""
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(msg) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
 
 
 if __name__ == "__main__":

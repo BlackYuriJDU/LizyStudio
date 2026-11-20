@@ -26,7 +26,12 @@ from fastapi.testclient import TestClient
 
 from lizystudio.backends.types import FitSummary, TuningSummary
 from lizystudio.services._job_active_slot import ActiveJobSlot
-from lizystudio.services._job_metadata import Job, JobMetadataStore, write_job_json
+from lizystudio.services._job_metadata import (
+    Job,
+    JobMetadataStore,
+    read_job_json,
+    write_job_json,
+)
 from lizystudio.services.jobs import JobStore
 
 WAIT = 10.0
@@ -149,12 +154,19 @@ class FakeTrainer:
 
 
 class Recorder:
-    """Counts status transitions, terminal frames, metrics and slot releases."""
+    """Counts status publications, terminal frames, metrics and slot releases."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._last: dict[str, str] = {}
         self.transitions: dict[str, list[str]] = defaultdict(list)
+        # Every status publication (Codex r1-5): one entry per write through
+        # the primitive's status writer, duplicates included.
+        self.publications: dict[str, list[str]] = defaultdict(list)
+        # The status-writer census (P-0119 PR-B): a ``meta.json`` save that
+        # changes the stored status outside the primitive's status writer.
+        self.census_violations: list[tuple[str, str, str]] = []
+        self._publishing = threading.local()
         self.frames: dict[str, list[str]] = defaultdict(list)
         self.slot_releases = 0
 
@@ -167,10 +179,27 @@ class Recorder:
         recorder = self
 
         def save_meta(store: JobMetadataStore, job: Job) -> None:
+            recorder._census(store, job)
             original_save(store, job)
             recorder._note_status(job.job_id, job.status)
 
         monkeypatch.setattr(JobMetadataStore, "save_meta", save_meta)
+        original_publish = JobMetadataStore.write_status_locked
+
+        def write_status_locked(
+            store: JobMetadataStore, job_id: str, status: str, **kwargs: Any
+        ) -> None:
+            recorder._publishing.active = True
+            try:
+                original_publish(store, job_id, status, **kwargs)
+            finally:
+                recorder._publishing.active = False
+            with recorder._lock:
+                recorder.publications[job_id].append(status)
+
+        monkeypatch.setattr(
+            JobMetadataStore, "write_status_locked", write_status_locked
+        )
         original_gauge = ActiveJobSlot._set_gauge
 
         def set_gauge(target: ActiveJobSlot, value: float) -> None:
@@ -182,6 +211,17 @@ class Recorder:
         monkeypatch.setattr(ActiveJobSlot, "_set_gauge", set_gauge)
         if broadcaster is not None:
             self._spy_frames(monkeypatch, broadcaster)
+
+    def _census(self, store: JobMetadataStore, job: Job) -> None:
+        if getattr(self._publishing, "active", False):
+            return
+        path = store.path_for(job.job_id, "meta")
+        if not path.exists():
+            return  # ``create``: the first row of a new job
+        stored = read_job_json(path)["status"]
+        if stored != job.status:
+            with self._lock:
+                self.census_violations.append((job.job_id, stored, job.status))
 
     def _note_status(self, job_id: str, status: str) -> None:
         with self._lock:
@@ -207,8 +247,10 @@ class Recorder:
             )
 
     def writes_of(self, job_id: str, status: str) -> int:
+        """How many times *status* was published for *job_id* (duplicates
+        count: an exactly-once assertion fails on a second publication)."""
         with self._lock:
-            return self.transitions[job_id].count(status)
+            return self.publications[job_id].count(status)
 
     def terminal_frames(self, job_id: str) -> list[str]:
         with self._lock:

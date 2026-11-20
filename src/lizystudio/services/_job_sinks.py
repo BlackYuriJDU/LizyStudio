@@ -7,11 +7,9 @@ instead of testing the mode:
 - :class:`ParentCommitSink` — thread mode: results are written status-free
   under the run token, then the status is committed through the primitive,
   and the effects it returns are emitted once.
-- :class:`LegacyChildStatusSink` — the subprocess child, until PR-B: the
-  child's status writes as before P-0119, except that it never writes
-  ``running`` (admission did), only over a non-terminal row, and never
-  touches the flags or the slot. The parent adopts the result with one
-  commit. PR-B deletes this class.
+- :class:`ChildOutcomeSink` — the subprocess child: it writes no
+  ``meta.json``; its outcome goes to the outcome file the parent's reconcile
+  commits (P-0119 PR-B), so a status becomes visible only with that commit.
 """
 
 from __future__ import annotations
@@ -20,8 +18,6 @@ import logging
 from typing import TYPE_CHECKING, Protocol
 
 from lizystudio.services._job_lifecycle_types import (
-    CANCELLED_CODE,
-    CANCELLED_MESSAGE,
     LifecycleEffects,
     Outcome,
     RunToken,
@@ -85,6 +81,9 @@ class OutcomeSink(Protocol):
     @property
     def token(self) -> RunToken | None: ...
 
+    @property
+    def persists_warnings(self) -> bool: ...
+
     def write_results(self, job: Job) -> bool: ...
 
     def commit(self, job: Job, outcome: Outcome, duration: float) -> None: ...
@@ -107,6 +106,10 @@ class ParentCommitSink:
     def token(self) -> RunToken | None:
         return self._token
 
+    @property
+    def persists_warnings(self) -> bool:
+        return True
+
     def write_results(self, job: Job) -> bool:
         return self._job_store.write_results(job, self._token)
 
@@ -116,50 +119,40 @@ class ParentCommitSink:
         emit_effects(self._job_store, self._broadcaster, effects, duration)
 
 
-class LegacyChildStatusSink:
-    """The subprocess child's status writer until PR-B (P-0119 residual)."""
+class ChildOutcomeSink:
+    """The subprocess child (P-0119 PR-B): it writes no ``meta.json`` at all.
 
-    def __init__(
-        self, job_store: JobStore, broadcaster: ProgressBroadcaster | None
-    ) -> None:
+    Results travel in the outcome file, warnings in the JSONL relay (the
+    parent persists them under the run token), and the outcome itself goes
+    to ``<job_dir>/outcome.json`` tagged with the run generation the parent
+    passed in the child's arguments. No frame is sent: the parent's commit
+    emits the one terminal / ``paused`` frame and the one metric.
+    """
+
+    def __init__(self, job_store: JobStore, run_gen: int) -> None:
         self._job_store = job_store
-        self._broadcaster = broadcaster
+        self._run_gen = run_gen
 
     @property
     def token(self) -> RunToken | None:
         return None
 
+    @property
+    def persists_warnings(self) -> bool:
+        return False
+
     def write_results(self, job: Job) -> bool:
-        self._job_store.update(job)
         return True
 
     def commit(self, job: Job, outcome: Outcome, duration: float) -> None:
-        from datetime import datetime, timezone
+        from lizystudio.services._job_outcome_file import write_outcome
 
-        completed_at = (
-            None
-            if outcome.status == "paused"
-            else datetime.now(timezone.utc).isoformat()
+        completed = outcome.status == "completed"
+        write_outcome(
+            self._job_store.path_for(job.job_id, "outcome"),
+            run_gen=self._run_gen,
+            outcome=outcome,
+            fit_result=job.fit_result if completed else None,
+            tune_result=job.tune_result if completed else None,
+            model_path=job.model_path if completed else None,
         )
-        written = self._job_store.legacy_child_write_status(
-            job.job_id, outcome.status, error=outcome.error, completed_at=completed_at
-        )
-        sync_job(job, self._job_store)
-        if written and self._broadcaster is not None:
-            _send_legacy(self._broadcaster, job.job_id, outcome)
-
-
-def _send_legacy(
-    broadcaster: ProgressBroadcaster, job_id: str, outcome: Outcome
-) -> None:
-    """The child's frame for its own write, as before P-0119 (PR-B removes)."""
-    if outcome.status == "completed":
-        broadcaster.send_completed(job_id)
-    elif outcome.status == "paused":
-        broadcaster.send_paused(job_id)
-    elif outcome.status == "cancelled":
-        broadcaster.send_error(job_id, CANCELLED_MESSAGE, code=CANCELLED_CODE)
-    elif outcome.code is None:
-        broadcaster.send_error(job_id, outcome.message or "")
-    else:
-        broadcaster.send_error(job_id, outcome.message or "", code=outcome.code)

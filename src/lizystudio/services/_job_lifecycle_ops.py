@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -49,6 +50,7 @@ class LifecycleOps:
     _tokens: dict[str, RunToken]
     _reset_gen: int
     _started: bool
+    _emit_gate: threading.Lock
 
     if TYPE_CHECKING:
 
@@ -67,6 +69,26 @@ class LifecycleOps:
 
         @staticmethod
         def _effects(job: Job, outcome: Outcome) -> LifecycleEffects: ...
+
+        def _revoke_locked(self, job_id: str) -> RunToken | None: ...
+
+        def _is_live_locked(self, token: RunToken) -> bool: ...
+
+    # --- the token-fenced frame (Codex r1-4) ---------------------------
+
+    def emit_if_live(self, token: RunToken, send: Callable[[], None]) -> bool:
+        """Call *send* (one broadcast) only while *token* is live; a frame of
+        a revoked run is dropped and logged (INV-LC-5, Codex r1-4)."""
+        with self._emit_gate:
+            if not self._is_live_locked(token):
+                _logger.info(
+                    "event='lifecycle.stale_frame_dropped' job=%s run=%d",
+                    token.job_id,
+                    token.run_gen,
+                )
+                return False
+            send()
+            return True
 
     # --- cancel and pause ----------------------------------------------
 
@@ -125,7 +147,7 @@ class LifecycleOps:
         """Revoke *job_id*'s run, write ``cancelled`` unless it is terminal,
         and release its slot. CANCEL stays (a still-running child reads it)."""
         with self.lock:
-            revoked = self._tokens.pop(job_id, None)
+            revoked = self._revoke_locked(job_id)
             if revoked is not None:
                 _logger.warning(
                     "event='lifecycle.force_release' job=%s run=%d",
@@ -167,13 +189,15 @@ class LifecycleOps:
 
     def abandon(self, token: RunToken) -> bool:
         """Drop a live run whose terminal write keeps failing: release its slot
-        and flags without a status write (#765 cleanup, token-conditioned)."""
+        and the PAUSE flag without a status write (#765 cleanup,
+        token-conditioned). CANCEL is kept: no terminal was published, and an
+        accepted cancel must survive until one is — a restart's ``recover``
+        then writes ``cancelled`` (INV-LC-4 / Q6, Codex r1-3)."""
         with self.lock:
-            if self._tokens.get(token.job_id) != token:
+            if not self._is_live_locked(token):
                 return False
-            del self._tokens[token.job_id]
+            self._revoke_locked(token.job_id)
             self._slot.release(token.job_id)
-            self._flags.clear_cancel(token.job_id)
             self._flags.clear_pause(token.job_id)
             _logger.error("event='lifecycle.run_abandoned' job=%s", token.job_id)
             return True
