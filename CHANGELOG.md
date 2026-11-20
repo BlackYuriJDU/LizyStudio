@@ -39,8 +39,9 @@ A job-lifecycle reliability release. Job status, the cancel and pause flags, and
 - **A second concurrent `POST /jobs/{id}/unpause`** answers 400 `JOB_NOT_PAUSED` at once.
 - **A new job is `running` from the moment it is admitted,** so Cancel works during setup. A cancel of a `pending` job is accepted.
 - **`DELETE /jobs/{id}` refuses a job that is being set up** with 400 `JOB_RUNNING`, as it refuses a running job. That includes a job admitted while the delete request is in flight.
-- **409 `JOB_CONFLICT` also answers a launch refused at admission.** This applies to `POST /workspace/fit`, `/workspace/tune` and `/jobs/{id}/unpause`. A launch is refused in three cases: the workspace was reset after the request was received, a cancel was accepted before admission, or the previous worker does not finish in time.
-  - A refusal caused by a reset or by an accepted cancel ends the job `cancelled`. This applies to new fit and tune jobs and to unpaused ones.
+- **409 `JOB_CONFLICT` also answers a launch refused at admission.** This applies to `POST /workspace/fit`, `/workspace/tune` and `/jobs/{id}/unpause`. A launch is refused in three cases: the workspace was reset after the request was received, a cancel was accepted before admission (fit and tune only), or the previous worker does not finish in time.
+  - A refusal caused by a reset ends the job `cancelled`, for new fit and tune jobs and for unpaused ones.
+  - A refusal caused by an accepted cancel ends a new fit or tune job `cancelled`. An unpause of a job cancelled in the meantime answers 400 `JOB_NOT_PAUSED` instead, as above.
   - Any other refusal (the previous worker did not finish in time) ends a new fit or tune job `failed`, and leaves an unpaused job `paused`.
 - **`POST /jobs/{id}/pause` after an accepted cancel** answers 400 `JOB_NOT_RUNNING`, even while the job still reads `running`. The cancel wins.
 - **A cancel accepted before a job's terminal write wins:** the job ends `cancelled` even if its work had finished. The result files stay on disk.
