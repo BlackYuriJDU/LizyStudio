@@ -19,6 +19,7 @@ against stubbed Octokit objects (``streak_monitor_harness.mjs``).
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,6 +52,66 @@ def _extract_script() -> str:
             f"found {len(bodies)}"
         )
     return bodies[0]
+
+
+NIGHTLY = REPO_ROOT / ".github" / "workflows" / "nightly.yml"
+_LIST_RE = re.compile(r"const TRACKED_JOBS = \[(.*?)\];", re.DOTALL)
+
+
+def _tracked_jobs(source: str, where: Path) -> list[str]:
+    """The quoted names inside a ``const TRACKED_JOBS = [...]`` literal."""
+    matches = _LIST_RE.findall(source)
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one TRACKED_JOBS literal in {where}, found {len(matches)}"
+        )
+    # Consume the whole array body: every element must be a double-quoted
+    # name followed by an optional comma. Anything else (a single-quoted or
+    # template string, a variable, a comment) is refused rather than
+    # skipped, so a tracked name can never escape the check below.
+    body = matches[0]
+    names: list[str] = []
+    pos = 0
+    element = re.compile(r'\s*"([^"\\]+)"\s*(?:,|(?=\s*$))')
+    while body[pos:].strip():
+        found = element.match(body, pos)
+        if found is None:
+            raise AssertionError(
+                f"unsupported TRACKED_JOBS element in {where}: {body[pos:].strip()!r}"
+            )
+        names.append(found.group(1))
+        pos = found.end()
+    if not names:
+        raise AssertionError(f"TRACKED_JOBS in {where} names no job")
+    return names
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "const TRACKED_JOBS = [\n  'nonexistent',\n  \"mutation-test\",\n];",
+        'const TRACKED_JOBS = [\n  "mutation-test",\n  OTHER,\n];',
+        "const TRACKED_JOBS = [\n  `mutation-test`,\n];",
+        "const TRACKED_JOBS = [\n];",
+    ],
+)
+def test_tracked_jobs_parser_refuses_what_it_cannot_read(literal: str) -> None:
+    with pytest.raises(AssertionError):
+        _tracked_jobs(literal, WORKFLOW)
+
+
+def test_tracked_jobs_name_real_nightly_jobs() -> None:
+    """Every job the monitor tracks is a job ``nightly.yml`` runs, and the
+    harness tracks the same list (Issue #617). A name that matches no job
+    is never "executed", so the monitor would skip it silently."""
+    monitor = _tracked_jobs(_extract_script(), WORKFLOW)
+    harness = _tracked_jobs(HARNESS.read_text(encoding="utf-8"), HARNESS)
+    nightly = yaml.safe_load(NIGHTLY.read_text(encoding="utf-8"))
+    job_names = {job.get("name", key) for key, job in nightly["jobs"].items()}
+
+    assert harness == monitor
+    missing = [name for name in monitor if name not in job_names]
+    assert missing == [], f"tracked jobs absent from {NIGHTLY}: {missing}"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required")

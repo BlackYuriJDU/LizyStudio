@@ -15,6 +15,7 @@ import pytest
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -35,7 +36,7 @@ def _make_completed_parent(store: JobStore) -> str:
         job_type="tune",
     )
     job.status = "completed"
-    store.update(job)
+    seed_job(store, job)
     return job.job_id
 
 

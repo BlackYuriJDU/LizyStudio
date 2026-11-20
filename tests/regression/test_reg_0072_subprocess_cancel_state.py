@@ -21,7 +21,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from lizystudio.backends.types import DataRef
+from lizystudio.services._job_lifecycle_types import Outcome
+from lizystudio.services._job_outcome_file import write_outcome
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import admit_running, seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -40,7 +43,7 @@ def _make_running_job(store: JobStore) -> str:
         job_type="fit",
     )
     job.status = "running"
-    store.update(job)
+    seed_job(store, job)
     return job.job_id
 
 
@@ -98,6 +101,7 @@ def test_cancel_transitions_running_job_to_cancelled(
         broadcaster=None,
         backend_name="lizyml",
         data_path="/data/x.csv",
+        token=admit_running(job_store, job),
     )
 
     assert result.status == "cancelled", (
@@ -128,6 +132,7 @@ def test_unexpected_exit_transitions_running_job_to_failed(
         broadcaster=None,
         backend_name="lizyml",
         data_path="/data/x.csv",
+        token=admit_running(job_store, job),
     )
 
     assert result.status == "failed"
@@ -141,17 +146,30 @@ def test_unexpected_exit_transitions_running_job_to_failed(
 def test_successful_exit_does_not_rewrite_state(
     job_store: JobStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When the subprocess already wrote a terminal state, keep it."""
+    """The child's ``completed`` outcome is published by the parent.
+
+    Overturned by P-0119 (子 / Q3: the outcome file): the child no longer
+    writes a status. It writes ``outcome.json`` tagged with its run
+    generation, and the parent's reconcile commits it. Before P-0119 the
+    child wrote ``completed`` to ``meta.json`` and the parent kept it. A
+    clean exit without an outcome is ``failed`` (see the next test).
+    """
     from lizystudio.services import subprocess_runner as sr
 
     job_id = _make_running_job(job_store)
     job = job_store.get(job_id)
     assert job is not None
 
-    # Simulate a successful run by writing the terminal state ourselves.
-    job.status = "completed"
-    job.model_path = "/tmp/fake"
-    job_store.update(job)
+    token = admit_running(job_store, job)
+    # Simulate the child's successful run: its outcome file, this run's gen.
+    write_outcome(
+        job_store.path_for(job.job_id, "outcome"),
+        run_gen=token.run_gen,
+        outcome=Outcome(status="completed"),
+        fit_result=None,
+        tune_result=None,
+        model_path="/tmp/fake",
+    )
 
     _patch_subprocess(monkeypatch, returncode=0)
 
@@ -161,7 +179,34 @@ def test_successful_exit_does_not_rewrite_state(
         broadcaster=None,
         backend_name="lizyml",
         data_path="/data/x.csv",
+        token=token,
     )
 
     assert result.status == "completed"
     assert result.error is None
+
+
+def test_clean_exit_without_an_outcome_is_failed(
+    job_store: JobStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P-0119 (子): rc 0 with no outcome file is not a success — the child
+    never reported one — so the parent commits ``failed``."""
+    from lizystudio.services import subprocess_runner as sr
+
+    job_id = _make_running_job(job_store)
+    job = job_store.get(job_id)
+    assert job is not None
+    token = admit_running(job_store, job)
+    _patch_subprocess(monkeypatch, returncode=0)
+
+    result = sr.run_job_in_subprocess(
+        job=job,
+        job_store=job_store,
+        broadcaster=None,
+        backend_name="lizyml",
+        data_path="/data/x.csv",
+        token=token,
+    )
+
+    assert result.status == "failed"
+    assert "without persisting a terminal status" in (result.error or "")

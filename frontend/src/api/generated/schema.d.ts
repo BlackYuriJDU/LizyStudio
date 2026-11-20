@@ -41,11 +41,14 @@ export interface paths {
          * Workspace Reset
          * @description Reset all workspace state.
          *
-         *     Cancels and drains any background fit / tune first (see
-         *     :func:`_teardown_active_job` for the cancel + slot-release choreography
-         *     and its degraded paths), then clears workspace state. The order matters:
-         *     workspace state is cleared *after* the slot wait so the shutting-down
-         *     runner thread still sees live ``ws.dataframe`` / ``ws.model`` references.
+         *     Cancels and drains any background fit / tune first, then clears
+         *     workspace state. The order is fixed (P-0119): (1) in one lifecycle
+         *     lock section, advance the lifecycle reset generation (an older
+         *     request can no longer be admitted) and cancel the active job; (2)
+         *     wait for its slot, and force-release it if it does not drain, which
+         *     ends the job ``cancelled``; (3) clear the workspace. The workspace is
+         *     cleared *after* the slot wait so the shutting-down runner still sees
+         *     live ``ws.dataframe`` / ``ws.model`` references.
          */
         post: operations["workspace_reset_api_workspace_reset_post"];
         delete?: never;
@@ -440,6 +443,12 @@ export interface paths {
          *     ``| None``) because ``from __future__ import annotations`` together
          *     with ``Optional`` + ``Depends`` breaks FastAPI's body detection,
          *     causing the parameter to be parsed as a query string.
+         *
+         *     P-0119: the job is created holding the slot, and admitted
+         *     (``running``) by the launcher before it waits for the previous
+         *     worker. A reset or a cancel between the two, or a failed wait,
+         *     answers 409 ``JOB_CONFLICT``; the job is then ``cancelled`` or
+         *     ``failed``.
          */
         post: operations["workspace_fit_api_workspace_fit_post"];
         delete?: never;
@@ -464,6 +473,9 @@ export interface paths {
          *     P-0086 (Issue #251): ``body.config`` may be provided to atomically
          *     overwrite ``ws.config`` at tune time. See ``workspace_fit`` above
          *     for the rationale behind the ``WorkspaceTuneRequest()`` default.
+         *
+         *     P-0119: admission and the 409 ``JOB_CONFLICT`` answers are the same
+         *     as for ``POST /fit``.
          */
         post: operations["workspace_tune_api_workspace_tune_post"];
         delete?: never;
@@ -510,10 +522,17 @@ export interface paths {
          * Delete Job
          * @description Delete a job. Running jobs cannot be deleted (v2-13 task 2).
          *
+         *     A job in setup (admitted, before its first callback) is ``running``
+         *     too, and is refused with 400 ``JOB_RUNNING``; so is a job admitted
+         *     while this request ran (checked again under the lifecycle lock).
+         *
          *     Pass ``?cascade=true`` to remove the entire descendant subtree
          *     created by Re-tune / Resume children (H-0062). When children are
          *     currently pending or running, cascade is required; otherwise the
-         *     request is rejected with ``PARENT_HAS_ACTIVE_CHILDREN``.
+         *     request is rejected with ``PARENT_HAS_ACTIVE_CHILDREN``. Before the
+         *     directories are removed, a child with a live run is asked to stop
+         *     and a job without one releases the slot it holds and its flags
+         *     (P-0119).
          */
         delete: operations["delete_job_api_jobs__job_id__delete"];
         options?: never;
@@ -572,19 +591,15 @@ export interface paths {
         put?: never;
         /**
          * Cancel Job
-         * @description Cancel a running or paused job (H-0011, P-0099 v3-20c).
+         * @description Cancel a job (H-0011, P-0099 v3-20c, P-0119).
          *
-         *     For ``running`` jobs the cancel signal is delivered via the cancel
-         *     flag and the cooperative callback (cancel-aware-cb) unwinds through
-         *     :class:`CancelledError` — the worker's finally-block writes
-         *     ``status="cancelled"`` and releases the slot.
-         *
-         *     For ``paused`` jobs there is no worker to observe a flag, so the
-         *     transition is performed directly here: ``paused -> cancelled`` is a
-         *     legal edge per :data:`LEGAL_TRANSITIONS`, and we explicitly release
-         *     the slot + clear the pause flag so the workspace is unblocked
-         *     immediately (case 案 a in P-0099 §6 — paused-as-zombie is worse UX
-         *     than just letting Cancel be a fast exit).
+         *     One lifecycle lock section decides. A job with a live run (running,
+         *     or in setup) gets the CANCEL flag and the run ends ``cancelled`` —
+         *     even when it had already produced a result before committing it.
+         *     A ``pending`` or ``paused`` job without a run is settled
+         *     ``cancelled`` at once: the slot is released and one terminal frame
+         *     and one metric are emitted. A terminal job answers 400
+         *     ``JOB_NOT_RUNNING``. An accepted cancel survives a server restart.
          */
         post: operations["cancel_job_api_jobs__job_id__cancel_post"];
         delete?: never;
@@ -608,12 +623,12 @@ export interface paths {
          *
          *     Pause is a tune-only action — fit jobs are short-running by design
          *     (training a single model with the user's chosen params), so a pause
-         *     primitive there has no usable resume target. The cooperative
-         *     callback inside the worker observes the on-disk PAUSE flag through
-         *     :meth:`JobStore.is_pause_requested` and unwinds via
-         *     :class:`PausedError`. ``_run_job_core`` writes ``status="paused"``
-         *     on disk and KEEPS slot ownership so the user's subsequent /unpause
-         *     click resumes the same job in place (P-0099 v3-20c invariant).
+         *     primitive there has no usable resume target. It is accepted only for
+         *     a live run with no cancel pending; a job in setup is a live run and
+         *     stops at its first callback. A ``pending``, ``paused`` or terminal
+         *     job answers 400 ``JOB_NOT_RUNNING`` (P-0119). The paused job keeps
+         *     the slot so the user's subsequent /unpause click resumes the same
+         *     job in place (P-0099 v3-20c invariant).
          */
         post: operations["pause_job_api_jobs__job_id__pause_post"];
         delete?: never;
@@ -633,7 +648,7 @@ export interface paths {
         put?: never;
         /**
          * Unpause Job
-         * @description Re-launch a paused tune in place (P-0099 v3-20d, R-1.4).
+         * @description Re-launch a paused tune in place (P-0099 v3-20d, R-1.4, P-0119).
          *
          *     Unlike ``POST /resume`` (H-0062 Phase B, failed→child job), unpause
          *     re-uses the SAME ``job_id``: the worker calls ``backend.tune`` with
@@ -646,10 +661,15 @@ export interface paths {
          *     ``PICKLE_INCOMPATIBLE`` before the relaunch, and the job stays
          *     paused (P-0116 D4). So is a study another lizyml major.minor wrote,
          *     read from the job's checkpoint sidecar (P-0117 D3,
-         *     ``details.kind == "lizyml_version_mismatch"``). Slot
-         *     ownership stays with the original job_id from paused into running
-         *     (paused→running is a legal INV-3 transition), so the active-slot
-         *     lock is never released across the round-trip.
+         *     ``details.kind == "lizyml_version_mismatch"``).
+         *
+         *     The job is admitted (``paused -> running``, a compare-and-set under
+         *     the lifecycle lock) before the launcher waits for the previous
+         *     worker, keeping its slot. A second concurrent unpause therefore
+         *     answers 400 ``JOB_NOT_PAUSED`` without waiting. An unpause that
+         *     started before a workspace reset, or whose wait for the previous
+         *     worker fails, answers 409 ``JOB_CONFLICT``; after a failed wait the
+         *     job is ``paused`` again (P-0119).
          *
          *     Workspace dataframe must still be loaded and matching the job's
          *     original ``data_ref``; mismatched data would silently corrupt the
@@ -870,6 +890,12 @@ export interface paths {
         /**
          * Retune Job
          * @description Start a Re-tune child job from a completed parent Tune (H-0062).
+         *
+         *     P-0119: the child is admitted when its launch starts, claiming the
+         *     empty slot. When another job holds the slot, or the workspace was
+         *     reset after the child was created, the answer is 409
+         *     ``JOB_CONFLICT`` and the child is settled (``failed`` or
+         *     ``cancelled``).
          */
         post: operations["retune_job_api_jobs__job_id__retune_post"];
         delete?: never;
@@ -890,6 +916,9 @@ export interface paths {
         /**
          * Resume Job
          * @description Resume a failed Tune Job from its last saved checkpoint (H-0062).
+         *
+         *     P-0119: admission and the 409 ``JOB_CONFLICT`` answers are the same
+         *     as for ``POST /jobs/{job_id}/retune``.
          */
         post: operations["resume_job_api_jobs__job_id__resume_post"];
         delete?: never;

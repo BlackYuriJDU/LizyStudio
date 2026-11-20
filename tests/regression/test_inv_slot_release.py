@@ -36,6 +36,7 @@ from lizystudio.backends.exceptions import CancelledError
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services._training_core import _run_job_core
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import admit_running, admitted_sink, fake_child_exit
 
 pytestmark = pytest.mark.unit
 
@@ -92,6 +93,7 @@ def test_inv1_path1_normal_completion_releases_slot(job_store: JobStore) -> None
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_ok,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert result.status == "completed"
@@ -116,6 +118,7 @@ def test_inv1_path2_cancel_releases_slot(job_store: JobStore) -> None:
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_cancel,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert result.status == "cancelled"
@@ -140,6 +143,7 @@ def test_inv1_path3_exception_releases_slot(job_store: JobStore) -> None:
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_boom,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert result.status == "failed"
@@ -158,7 +162,7 @@ def test_inv1_path3_exception_releases_slot(job_store: JobStore) -> None:
 #   ``status="failed"`` when the child died without persisting a
 #   terminal — see ``services/subprocess_runner.py:run_job_in_subprocess``
 #   lines 250-275.
-# - ``_run_subprocess_job.finally`` then unconditionally calls
+# - (before P-0119) ``_run_subprocess_job.finally`` then unconditionally calls
 #   ``release_active`` — see ``services/_training_core.py:362-363``.
 #
 # The xfail placeholder originally lived here because the v3-17 (R-1.1)
@@ -200,7 +204,7 @@ def test_inv1_path4_sigkill_subprocess_releases_slot_within_bounded_time(
     The mock simulates the parent's view of a kill -9: the subprocess
     runner returns the job unchanged (still ``pending``/``running``
     on disk because the child never reached ``_run_job_core.finally``).
-    ``_run_subprocess_job.finally`` MUST still call ``release_active``,
+    the reconcile commit (P-0119) MUST still release the slot,
     and the bounded time check exists so a future regression that
     blocks the parent thread on a dead PID is caught immediately.
     """
@@ -213,21 +217,20 @@ def test_inv1_path4_sigkill_subprocess_releases_slot_within_bounded_time(
 
     bounded_time_window_s = 15.0
 
-    def fake_run_subprocess(**kwargs: Any) -> Any:
-        # Return the job unchanged to simulate a child that died
-        # mid-run without writing a terminal status. The parent's
-        # _run_subprocess_job.finally is what we are testing here.
-        return kwargs["job"]
-
-    monkeypatch.setattr(
-        "lizystudio.services.subprocess_runner.run_job_in_subprocess",
-        fake_run_subprocess,
-    )
+    # P-0119: the child exits (SIGKILL, rc -9) without writing a terminal;
+    # the parent's real reconcile — a commit of the run token — releases the
+    # slot (``_run_subprocess_job`` has no ``finally`` release any more).
+    fake_child_exit(monkeypatch, status=None, returncode=-9)
 
     ws = _make_ws_mock_for_subprocess()
     start = time.monotonic()
     training_module._run_subprocess_job(
-        ws, job, job_store, broadcaster=MagicMock(), epoch=ws.current_epoch()
+        ws,
+        job,
+        job_store,
+        broadcaster=MagicMock(),
+        token=admit_running(job_store, job),
+        epoch=ws.current_epoch(),
     )
     elapsed = time.monotonic() - start
 
@@ -237,7 +240,7 @@ def test_inv1_path4_sigkill_subprocess_releases_slot_within_bounded_time(
     )
     assert job_store.active_job_id is None, (
         "INV-1 path 4: subprocess crash must release the slot via "
-        "_run_subprocess_job.finally"
+        "the reconcile commit (P-0119)"
     )
 
 
@@ -292,6 +295,7 @@ def test_inv1_path5_ws_disconnect_does_not_release_until_terminal(
         job_store=job_store,
         broadcaster=broadcaster,
         execute_fn=execute_ok,
+        sink=admitted_sink(job_store, job, broadcaster),
     )
 
     assert job_store.active_job_id is None, (

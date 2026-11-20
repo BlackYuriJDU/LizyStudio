@@ -15,9 +15,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Query, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from lizystudio.api._lifecycle_http import unpause_refusal
 from lizystudio.api.deps import get_broadcaster
 from lizystudio.api.errors import (
     ExportError,
+    JobConflictError,
     JobNotCompletedError,
     JobNotFoundError,
     JobRunningError,
@@ -51,6 +53,9 @@ from lizystudio.backends.exceptions import (
 from lizystudio.backends.exceptions import (
     RefitRequiredError as _BackendRefitRequired,
 )
+from lizystudio.services._job_control_flags import FlagNotPersistedError
+from lizystudio.services._job_lifecycle_types import AdmissionRefused
+from lizystudio.services._job_sinks import emit_effects
 from lizystudio.services.export import export_code_as_zip, export_model, export_report
 from lizystudio.services.jobs import (
     Job,
@@ -64,7 +69,11 @@ from lizystudio.services.jobs import (
     get_metrics_table,
     get_split_summary,
 )
-from lizystudio.services.training import start_tune_async, verify_unpause_study
+from lizystudio.services.training import (
+    PreviousJobStillRunningError,
+    start_tune_async,
+    verify_unpause_study,
+)
 from lizystudio.services.workspace import WorkspaceState, get_workspace
 from lizystudio.ws.progress import ProgressBroadcaster
 
@@ -205,21 +214,26 @@ def delete_job(
 ) -> dict[str, Any]:
     """Delete a job. Running jobs cannot be deleted (v2-13 task 2).
 
+    A job in setup (admitted, before its first callback) is ``running``
+    too, and is refused with 400 ``JOB_RUNNING``; so is a job admitted
+    while this request ran (checked again under the lifecycle lock).
+
     Pass ``?cascade=true`` to remove the entire descendant subtree
     created by Re-tune / Resume children (H-0062). When children are
     currently pending or running, cascade is required; otherwise the
-    request is rejected with ``PARENT_HAS_ACTIVE_CHILDREN``.
+    request is rejected with ``PARENT_HAS_ACTIVE_CHILDREN``. Before the
+    directories are removed, a child with a live run is asked to stop
+    and a job without one releases the slot it holds and its flags
+    (P-0119).
     """
     job = _get_job_or_404(job_id, job_store)
     if job.status == "running":
         raise JobRunningError(job_id)
 
     # H-0062 / P-0099 v3-20c: guard against orphaning in-flight or paused
-    # children on a non-cascade delete. Collect the direct active
-    # descendants first so the error details list exactly what would be
-    # lost. ``paused`` joins ``pending`` / ``running`` here because a
-    # paused tune still holds the workspace slot and owns the Optuna
-    # sqlite that feeds /unpause.
+    # children on a non-cascade delete. ``paused`` joins ``pending`` /
+    # ``running`` here because a paused tune still holds the workspace slot
+    # and owns the Optuna sqlite that feeds /unpause.
     if not cascade and job_store.has_active_children(job_id):
         active: list[str] = []
         for cid in job_store.get_child_job_ids(job_id):
@@ -228,28 +242,10 @@ def delete_job(
                 active.append(cid)
         raise ParentHasActiveChildrenError(job_id, active)
 
-    if cascade:
-        # Active running/pending children must be asked to stop before we
-        # rmtree their directories. Cancel flags are best-effort; the
-        # actual subprocess may still be running when rmtree fires, but
-        # the run_tune wrapper tolerates a missing job dir via its finally
-        # block.  Paused children have no worker to observe a cancel
-        # flag, so the slot is released directly here (P-0099 v3-20c) —
-        # status persistence is skipped because the job dir is rmtree'd
-        # immediately below.
-        for cid in job_store.get_child_job_ids(job_id):
-            child = job_store.get(cid)
-            if child is None:
-                continue
-            if child.status in ("pending", "running"):
-                job_store.request_cancel(cid)
-            elif child.status == "paused":
-                job_store.release_active(cid)
-                job_store.clear_pause(cid)
-        removed = job_store.delete(job_id, cascade=True)
-    else:
-        removed = job_store.delete(job_id)
-
+    targets = [job_id, *job_store.get_child_job_ids(job_id)] if cascade else [job_id]
+    if not job_store.release_for_delete(targets):
+        raise JobRunningError(job_id)
+    removed = job_store.delete(job_id, cascade=cascade)
     if not removed:
         raise JobNotFoundError(job_id)
     return {"status": "deleted", "removed_job_ids": removed}
@@ -259,38 +255,32 @@ def delete_job(
 def cancel_job(
     job_id: str,
     job_store: JobStore = Depends(get_job_store),
+    broadcaster: ProgressBroadcaster = Depends(get_broadcaster),
 ) -> dict[str, str]:
-    """Cancel a running or paused job (H-0011, P-0099 v3-20c).
+    """Cancel a job (H-0011, P-0099 v3-20c, P-0119).
 
-    For ``running`` jobs the cancel signal is delivered via the cancel
-    flag and the cooperative callback (cancel-aware-cb) unwinds through
-    :class:`CancelledError` — the worker's finally-block writes
-    ``status="cancelled"`` and releases the slot.
-
-    For ``paused`` jobs there is no worker to observe a flag, so the
-    transition is performed directly here: ``paused -> cancelled`` is a
-    legal edge per :data:`LEGAL_TRANSITIONS`, and we explicitly release
-    the slot + clear the pause flag so the workspace is unblocked
-    immediately (case 案 a in P-0099 §6 — paused-as-zombie is worse UX
-    than just letting Cancel be a fast exit).
+    One lifecycle lock section decides. A job with a live run (running,
+    or in setup) gets the CANCEL flag and the run ends ``cancelled`` —
+    even when it had already produced a result before committing it.
+    A ``pending`` or ``paused`` job without a run is settled
+    ``cancelled`` at once: the slot is released and one terminal frame
+    and one metric are emitted. A terminal job answers 400
+    ``JOB_NOT_RUNNING``. An accepted cancel survives a server restart.
     """
-    job = _get_job_or_404(job_id, job_store)
-    if job.status == "running":
-        job_store.request_cancel(job_id)
-        return {"status": "cancelled"}
-    if job.status == "paused":
-        # Direct transition: no worker observing the flag, so the
-        # worker-side terminal write that normally rides on the cancel
-        # flag will never fire.
-        job_store.set_status(job_id, "cancelled")
-        job_store.release_active(job_id)
-        job_store.clear_pause(job_id)
-        return {"status": "cancelled"}
-    raise StudioError(
-        "JOB_NOT_RUNNING",
-        f"Job {job_id} is not running or paused (status: {job.status})",
-        400,
-    )
+    _get_job_or_404(job_id, job_store)
+    try:
+        result = job_store.cancel(job_id)
+    except FlagNotPersistedError as exc:
+        # P-0119 (Codex r2-2): no 200 without the durable CANCEL record.
+        raise StudioError("CANCEL_NOT_PERSISTED", str(exc), 500) from exc
+    if not result.accepted:
+        raise StudioError(
+            "JOB_NOT_RUNNING",
+            f"Job {job_id} is not running or paused (status: {result.status})",
+            400,
+        )
+    emit_effects(job_store, broadcaster, result.effects)
+    return {"status": "cancelled"}
 
 
 # --- Pause / Unpause (P-0099 v3-20d, R-1.4 / Issue #360) ---
@@ -305,12 +295,12 @@ def pause_job(
 
     Pause is a tune-only action — fit jobs are short-running by design
     (training a single model with the user's chosen params), so a pause
-    primitive there has no usable resume target. The cooperative
-    callback inside the worker observes the on-disk PAUSE flag through
-    :meth:`JobStore.is_pause_requested` and unwinds via
-    :class:`PausedError`. ``_run_job_core`` writes ``status="paused"``
-    on disk and KEEPS slot ownership so the user's subsequent /unpause
-    click resumes the same job in place (P-0099 v3-20c invariant).
+    primitive there has no usable resume target. It is accepted only for
+    a live run with no cancel pending; a job in setup is a live run and
+    stops at its first callback. A ``pending``, ``paused`` or terminal
+    job answers 400 ``JOB_NOT_RUNNING`` (P-0119). The paused job keeps
+    the slot so the user's subsequent /unpause click resumes the same
+    job in place (P-0099 v3-20c invariant).
     """
     job = _get_job_or_404(job_id, job_store)
     if job.job_type != "tune":
@@ -319,13 +309,17 @@ def pause_job(
             f"Pause is only available on tune jobs (job_type: {job.job_type})",
             400,
         )
-    if job.status != "running":
+    try:
+        accepted = job_store.pause(job_id)
+    except FlagNotPersistedError as exc:
+        # P-0119 (Codex r2-2): no 200 without the durable PAUSE record.
+        raise StudioError("PAUSE_NOT_PERSISTED", str(exc), 500) from exc
+    if not accepted:
         raise StudioError(
             "JOB_NOT_RUNNING",
             f"Pause requires a running job (status: {job.status})",
             400,
         )
-    job_store.request_pause(job_id)
     return {"status": "pause_requested"}
 
 
@@ -336,7 +330,7 @@ def unpause_job(
     ws: WorkspaceState = Depends(get_workspace),
     broadcaster: ProgressBroadcaster = Depends(get_broadcaster),
 ) -> dict[str, str]:
-    """Re-launch a paused tune in place (P-0099 v3-20d, R-1.4).
+    """Re-launch a paused tune in place (P-0099 v3-20d, R-1.4, P-0119).
 
     Unlike ``POST /resume`` (H-0062 Phase B, failed→child job), unpause
     re-uses the SAME ``job_id``: the worker calls ``backend.tune`` with
@@ -349,16 +343,43 @@ def unpause_job(
     ``PICKLE_INCOMPATIBLE`` before the relaunch, and the job stays
     paused (P-0116 D4). So is a study another lizyml major.minor wrote,
     read from the job's checkpoint sidecar (P-0117 D3,
-    ``details.kind == "lizyml_version_mismatch"``). Slot
-    ownership stays with the original job_id from paused into running
-    (paused→running is a legal INV-3 transition), so the active-slot
-    lock is never released across the round-trip.
+    ``details.kind == "lizyml_version_mismatch"``).
+
+    The job is admitted (``paused -> running``, a compare-and-set under
+    the lifecycle lock) before the launcher waits for the previous
+    worker, keeping its slot. A second concurrent unpause therefore
+    answers 400 ``JOB_NOT_PAUSED`` without waiting. An unpause that
+    started before a workspace reset, or whose wait for the previous
+    worker fails, answers 409 ``JOB_CONFLICT``; after a failed wait the
+    job is ``paused`` again (P-0119).
 
     Workspace dataframe must still be loaded and matching the job's
     original ``data_ref``; mismatched data would silently corrupt the
     Optuna study (best_value compared across different data).
     """
+    reset_gen = job_store.capture_reset_gen()
     job = _get_job_or_404(job_id, job_store)
+    _require_unpausable(job, ws, job_store)
+    try:
+        start_tune_async(
+            ws=ws,
+            job_store=job_store,
+            broadcaster=broadcaster,
+            config=job.config,
+            dataframe=ws.dataframe,
+            job=job,
+            reset_gen=reset_gen,
+            resume_from_existing_study=True,
+        )
+    except AdmissionRefused as exc:
+        raise unpause_refusal(job_id, exc) from None
+    except PreviousJobStillRunningError:
+        raise JobConflictError(job_id) from None
+    return {"status": "unpause_started", "job_id": job_id}
+
+
+def _require_unpausable(job: Job, ws: WorkspaceState, job_store: JobStore) -> None:
+    """The unpause preconditions checked before admission (400s)."""
     if job.job_type != "tune":
         raise StudioError(
             "JOB_NOT_PAUSEABLE",
@@ -377,28 +398,12 @@ def unpause_job(
     from lizystudio.api.workspace import require_relaunchable_config
 
     require_relaunchable_config(ws, job.config)
-    # P-0116 D4 / P-0117 D3: a study the adapter cannot continue (e.g. one
-    # lizyml 0.15 wrote, or one another lizyml minor wrote) is refused here,
-    # with the job still paused, not by failing it.
+    # P-0116 D4 / P-0117 D3: a study the adapter cannot continue is refused
+    # here, with the job still paused, not by failing it.
     try:
         verify_unpause_study(backend=ws.backend, job_store=job_store, job=job)
     except CheckpointIncompatibleError as exc:
-        raise pickle_incompatible_from(job_id, exc) from exc
-
-    # Clear the pause flag BEFORE re-launching so the cb does not
-    # immediately raise PausedError again on its first observation.
-    job_store.clear_pause(job_id)
-
-    start_tune_async(
-        ws=ws,
-        job_store=job_store,
-        broadcaster=broadcaster,
-        config=job.config,
-        dataframe=ws.dataframe,
-        job=job,
-        resume_from_existing_study=True,
-    )
-    return {"status": "unpause_started", "job_id": job_id}
+        raise pickle_incompatible_from(job.job_id, exc) from exc
 
 
 # --- Result viewing ---

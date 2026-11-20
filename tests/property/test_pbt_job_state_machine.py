@@ -9,13 +9,14 @@ status combination nobody hand-listed surfaces at CI time anyway.
 Invariants checked:
 
 - **INV-no-illegal**: any transition NOT in ``LEGAL_TRANSITIONS`` is
-  rejected by ``JobStore.set_status`` with ``AssertionError``.
+  rejected by the P-0119 status writer (formerly ``JobStore.set_status``)
+  with ``AssertionError``.
 - **INV-replay-safe**: applying a legal transition twice (idempotent
-  same-status set, e.g. ``running -> running`` via the set_status API
+  same-status set, e.g. ``running -> running`` via the guarded status write (P-0119)
   on the same job's current status) is either rejected or a no-op,
   not silently allowed past the guard.
 - **INV-terminal-no-resurrection**: once a job reaches any state in
-  ``TERMINAL_STATES``, no subsequent ``set_status`` to any state
+  ``TERMINAL_STATES``, no subsequent guarded status write (P-0119) to any state
   (including the same terminal) is accepted as a legal transition.
 
 Per ``feedback_combinatorial_branch_coverage`` (memory):
@@ -37,6 +38,7 @@ from hypothesis import strategies as st
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import guarded_status
 from tests.regression.test_inv_state_machine import (
     JOB_STATUSES,
     LEGAL_TRANSITIONS,
@@ -88,7 +90,7 @@ def _drive_to(store: JobStore, job_id: str, target: str) -> bool:
     if target not in paths:
         return False
     for state in paths[target]:
-        store.set_status(job_id, state)
+        guarded_status(store, job_id, state)
     return True
 
 
@@ -104,8 +106,8 @@ def test_pbt_set_status_honors_legal_transitions(
 ) -> None:
     """For every (src, dst) pair in ``JOB_STATUSES × JOB_STATUSES``:
 
-    - if (src, dst) ∈ LEGAL_TRANSITIONS → ``set_status`` accepts it
-    - if (src, dst) ∉ LEGAL_TRANSITIONS → ``set_status`` raises
+    - if (src, dst) ∈ LEGAL_TRANSITIONS → the guarded status write accepts it
+    - if (src, dst) ∉ LEGAL_TRANSITIONS → the guarded status write raises
       ``AssertionError``
 
     Drives the job from ``pending`` to ``src`` via the legal-transition
@@ -143,7 +145,7 @@ def test_pbt_set_status_honors_legal_transitions(
 
     is_legal = (src, dst) in LEGAL_TRANSITIONS
     if is_legal:
-        store.set_status(job.job_id, dst)
+        guarded_status(store, job.job_id, dst)
         landed = store.get(job.job_id)
         assert landed is not None and landed.status == dst, (
             f"Legal transition ({src!r} -> {dst!r}) did not persist; "
@@ -151,7 +153,7 @@ def test_pbt_set_status_honors_legal_transitions(
         )
     else:
         with pytest.raises(AssertionError):
-            store.set_status(job.job_id, dst)
+            guarded_status(store, job.job_id, dst)
         # Status must not have changed on the rejection path.
         unchanged = store.get(job.job_id)
         assert unchanged is not None and unchanged.status == src, (
@@ -172,7 +174,7 @@ def test_pbt_terminal_states_admit_no_outgoing_transitions(
 ) -> None:
     """INV-terminal-no-resurrection.
 
-    Once a job is in any terminal state, no subsequent ``set_status``
+    Once a job is in any terminal state, no subsequent guarded status write (P-0119)
     to ANY state in ``JOB_STATUSES`` is legal. Including the same
     terminal again (idempotent re-write is still a rewrite from the
     state machine's point of view).
@@ -191,7 +193,7 @@ def test_pbt_terminal_states_admit_no_outgoing_transitions(
 
     for dst in sorted(JOB_STATUSES):
         with pytest.raises(AssertionError):
-            store.set_status(job.job_id, dst)
+            guarded_status(store, job.job_id, dst)
         # The terminal state must stay terminal across every rejected
         # write — no half-committed rewrite.
         current = store.get(job.job_id)

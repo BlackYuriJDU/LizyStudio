@@ -14,7 +14,6 @@ from __future__ import annotations
 import builtins
 import logging
 import shutil
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -23,6 +22,7 @@ from fastapi import Request
 from lizystudio.backends.types import DataRef
 from lizystudio.services._job_active_slot import ActiveJobSlot
 from lizystudio.services._job_control_flags import JobControlFlags
+from lizystudio.services._job_lifecycle import JobLifecycle
 from lizystudio.services._job_lineage import JobLineage
 
 # Most of these are pure re-exports kept in ``__all__`` so existing
@@ -38,6 +38,7 @@ from lizystudio.services._job_metadata import (
     artifact_path,
     read_job_json,
 )
+from lizystudio.services._job_store_lifecycle import JobStoreLifecycle
 
 if TYPE_CHECKING:
     from lizystudio.backends.base import BackendAdapter
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-class JobStore:
+class JobStore(JobStoreLifecycle):
     """Disk-backed job store — the orchestrator over four focused collaborators.
 
     Layout per BLUEPRINT §3.4.4::
@@ -73,9 +74,16 @@ class JobStore:
     ``JobStore`` itself owns: the H-0084 model cache, the metrics
     registry forwarding (``record_job_terminal``), and the cross-concern
     orchestration that genuinely spans collaborators — ``delete`` (cascade
-    BFS + dir removal + cache eviction), ``reconcile_at_startup`` (orphan
-    fail + paused-survivor re-attach), ``set_status`` (the INV-3 state-
-    machine guard around a meta write).
+    BFS + dir removal + cache eviction) — and it fronts the P-0119
+    lifecycle primitive (:class:`~lizystudio.services._job_lifecycle.JobLifecycle`):
+    every status, cancel / pause flag and slot transition (admit, start,
+    commit, abort, cancel, pause, reset, force-release, recover, delete)
+    runs under its one lock. The raw flag and slot methods
+    (``request_cancel`` / ``clear_cancel`` / ``request_pause`` /
+    ``clear_pause`` / ``claim_active`` / ``release_active`` /
+    ``force_release_active_if``) remain for the subprocess child's reads and
+    for test seeding; no src caller outside the primitive mutates through
+    them (BLUEPRINT §3.4.2, the P-0119 writer list).
     """
 
     def __init__(
@@ -90,6 +98,8 @@ class JobStore:
         self._slot = ActiveJobSlot(self._meta, metrics)
         self._flags = JobControlFlags(self._meta)
         self._lineage = JobLineage(self._meta)
+        # P-0119: the transition primitive over the slot and the flags.
+        self._lc = JobLifecycle(self._meta, self._slot, self._flags)
         # A-9: metrics registry threaded through here for the terminal-
         # transition counters (``record_job_terminal``). The active-slot
         # gauge lives inside ``ActiveJobSlot``; ``None`` in the subprocess
@@ -180,9 +190,11 @@ class JobStore:
         return self._meta.list(status=status, sort=sort)
 
     def update(self, job: Job) -> None:
-        """Persist job state (meta + result sidecars). See
+        """Persist results, model path and warnings — never the status
+        (P-0119). Runs under the lifecycle lock. See
         :meth:`JobMetadataStore.update`."""
-        self._meta.update(job)
+        with self._lc.lock:
+            self._meta.update(job)
 
     def delete(self, job_id: str, *, cascade: bool = False) -> builtins.list[str]:
         """Delete a job directory. Returns the list of removed job IDs.
@@ -299,129 +311,6 @@ class JobStore:
         :meth:`JobControlFlags.clear_pause`."""
         self._flags.clear_pause(job_id)
 
-    # --- INV-3 runtime guard (P-0099 v3-20c) ---
-
-    def set_status(self, job_id: str, new_status: str) -> None:
-        """Persist ``new_status`` for *job_id* under the INV-3 guard.
-
-        Asserts ``(current_status, new_status)`` is a member of
-        :data:`tests/regression/test_inv_state_machine.py:LEGAL_TRANSITIONS`
-        (re-declared inline below to avoid a runtime dependency on the
-        test module).  Illegal transitions raise ``AssertionError`` so a
-        regression in the API layer cannot silently rewind audit trails
-        or skip non-terminal states.
-
-        Direct ``update(job)`` writes still bypass this guard — the
-        runtime assertion is opt-in for callers that mutate status at
-        the API boundary (e.g. /pause, /unpause).  ``_run_job_core``
-        keeps using ``update`` because its except-branches each have a
-        single legal pre-state, so an extra assertion would only be
-        defensive without changing the executable contract.
-        """
-        # P-0099 INV-3: pinned in tests/regression/test_inv_state_machine.py
-        # under ``LEGAL_TRANSITIONS``. Mirrored here as a frozenset literal
-        # so the runtime guard does not import from a test module.
-        legal_transitions: frozenset[tuple[str, str]] = frozenset(
-            {
-                ("pending", "running"),
-                ("pending", "cancelled"),
-                ("running", "completed"),
-                ("running", "failed"),
-                ("running", "cancelled"),
-                ("running", "paused"),
-                ("paused", "running"),
-                ("paused", "cancelled"),
-                ("paused", "failed"),
-            }
-        )
-        job = self._meta.get(job_id)
-        assert job is not None, f"set_status: job {job_id!r} does not exist"
-        current = job.status
-        assert (current, new_status) in legal_transitions, (
-            f"INV-3 violation: illegal transition {current!r} -> {new_status!r} "
-            f"for job {job_id!r}"
-        )
-        # mypy: new_status is a free str on the API surface; the literal
-        # widening here is verified by the legal_transitions membership
-        # check above, which only contains valid Job.status literals.
-        job.status = new_status  # type: ignore[assignment]
-        self._meta.update(job)
-
-    # --- Startup reconciliation (P-0099 v3-22a, R-1.5b) ---
-
-    def reconcile_at_startup(self) -> None:
-        """Reconcile in-memory state with disk after server (re)start.
-
-        At fresh process start the in-memory ``_active_job_id`` is
-        ``None`` while ``meta.json`` files survive the restart. Three
-        invariants must be restored:
-
-          INV-restart-1: ``running`` / ``pending`` rows on disk are
-            orphaned — no thread / subprocess survived. Reconcile to
-            ``failed`` with a clear error so the UI does not dangle.
-
-          INV-restart-2: at most ONE ``paused`` job survives (newest
-            by ``created_at`` wins). The survivor claims the active
-            slot so a concurrent /tune is rejected with
-            ``JOB_CONFLICT`` until the user clicks Resume or Cancel
-            (in-place /unpause contract from v3-20d).
-
-          INV-restart-3: terminal rows (completed / failed / cancelled)
-            are NEVER rewritten — reconciliation is a one-way forward
-            arrow.
-
-        Idempotent: running a second time on already-reconciled state
-        is a no-op (paused survivor stays paused, terminals stay
-        terminal, no further candidates exist).
-        """
-        paused_candidates: list[Job] = []
-        running_orphans: list[Job] = []
-        for job in self._meta.list():
-            if job.status in ("running", "pending"):
-                running_orphans.append(job)
-            elif job.status == "paused":
-                paused_candidates.append(job)
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        for job in running_orphans:
-            _logger.warning(
-                "Reconciling orphaned %s job %s to failed at startup",
-                job.status,
-                job.job_id,
-            )
-            job.status = "failed"
-            job.error = "Server restarted before this job could complete"
-            job.completed_at = now
-            self._meta.update(job)
-
-        if len(paused_candidates) > 1:
-            paused_candidates.sort(key=lambda j: j.created_at, reverse=True)
-            winner = paused_candidates[0]
-            _logger.warning(
-                "Multiple paused jobs at startup (%d); keeping newest %s, "
-                "reconciling the rest to failed",
-                len(paused_candidates),
-                winner.job_id,
-            )
-            for job in paused_candidates[1:]:
-                job.status = "failed"
-                job.error = (
-                    "Multiple paused jobs found at startup; only the newest "
-                    "is preserved (INV-1: at most one paused job)"
-                )
-                job.completed_at = now
-                self._meta.update(job)
-            paused_candidates = [winner]
-
-        if paused_candidates:
-            survivor = paused_candidates[0]
-            self._slot.reattach(survivor.job_id)
-            _logger.info(
-                "Re-attached paused job %s to active slot at startup",
-                survivor.job_id,
-            )
-
     # --- Active job tracking — delegated to ActiveJobSlot (#451) ---
 
     def create_and_claim_active(
@@ -433,15 +322,16 @@ class JobStore:
         job_type: Literal["fit", "tune"],
         parent_job_id: str | None = None,
     ) -> Job | None:
-        """Atomically create a pending job and claim the active slot.
-        See :meth:`ActiveJobSlot.create_and_claim`."""
-        return self._slot.create_and_claim(
+        """Atomically create a pending job and claim the active slot; the job
+        only. API callers use :meth:`create_and_reserve` (P-0119)."""
+        reservation = self.create_and_reserve(
             backend_name=backend_name,
             config=config,
             data_ref=data_ref,
             job_type=job_type,
             parent_job_id=parent_job_id,
         )
+        return None if reservation is None else reservation[0]
 
     def claim_active(self, job_id: str) -> bool:
         """Attempt to claim the active slot (idempotent re-claim by the

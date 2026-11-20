@@ -96,16 +96,14 @@ class ActiveJobSlot:
         orphan ``failed`` directory for the losing caller — nothing is
         written until the slot is actually held.
 
-        ``_run_job_core`` later re-invokes :meth:`claim` with the same
-        ``job_id`` — that call is a no-op because the slot is already
-        owned by this job.
+        P-0119: called only by ``JobLifecycle.create_and_reserve`` under the
+        lifecycle lock, which first refuses when the holder has a live run
+        token; the worker never re-claims (admission holds the slot).
 
         Before refusing a request the current holder is checked for
-        staleness (terminal ``completed`` / ``failed`` / ``cancelled``
-        rows have no business occupying the slot — can happen if a
-        subprocess path returned without going through
-        ``_run_job_core.finally``, the server restarted mid-job, or a
-        cancel left the runner unable to reach the release call). Rather
+        staleness (a terminal row with no live run has no business
+        occupying the slot — e.g. a run abandoned after its terminal write
+        failed). Rather
         than locking the workspace out permanently, the slot is reclaimed
         from the stale owner so the next fit/tune can proceed. The stale
         job's on-disk state is left untouched.

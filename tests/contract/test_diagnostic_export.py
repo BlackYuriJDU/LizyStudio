@@ -29,6 +29,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.lifecycle_seed import seed_job
+
 pytestmark = pytest.mark.integration
 
 
@@ -63,7 +65,7 @@ def _seed_job(client: TestClient) -> str:
         job_type="fit",
     )
     job.status = "completed"
-    job_store.update(job)
+    seed_job(job_store, job)
     return job.job_id
 
 

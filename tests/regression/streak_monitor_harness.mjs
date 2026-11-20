@@ -33,6 +33,7 @@ const runMonitor = new Function(
 const TRACKED_JOBS = [
   "mutation-test",
   "E2E visual + a11y (Nightly, non-blocking)",
+  "E2E ci-flaky (Nightly, non-blocking)",
 ];
 
 function makeStubs({ runs, jobsByRun, triggerRunId }) {

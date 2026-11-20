@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from lizystudio.backends.types import DataRef, FitSummary, TuningSummary
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import admit_running, seed_job, seed_status
 
 pytestmark = pytest.mark.integration
 
@@ -40,7 +41,7 @@ def _create_completed_job(client: TestClient, sample_data_ref: DataRef) -> str:
         fold_count=5,
         params=[{"n_estimators": 100}],
     )
-    job_store.update(job)
+    seed_job(job_store, job)
     return job.job_id
 
 
@@ -109,7 +110,7 @@ def test_get_job_with_tune_result(client: TestClient, sample_data_ref: DataRef) 
     job.fit_result = FitSummary(
         metrics={"auc": 0.98}, fold_count=5, params=[{"lr": 0.01}]
     )
-    job_store.update(job)
+    seed_job(job_store, job)
 
     res = client.get(f"/api/jobs/{job.job_id}")
     assert res.status_code == 200
@@ -213,7 +214,7 @@ def test_delete_running_job_rejected(
         job_type="fit",
     )
     job.status = "running"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     res = client.delete(f"/api/jobs/{job.job_id}")
     assert res.status_code == 400
@@ -272,7 +273,7 @@ def test_job_summary_includes_model_name(
     )
     job.status = "completed"
     job.fit_result = FitSummary(metrics={"auc": 0.9}, fold_count=5, params=[])
-    job_store.update(job)
+    seed_job(job_store, job)
 
     res = client.get("/api/jobs/")
     assert res.status_code == 200
@@ -300,7 +301,7 @@ def test_job_summary_includes_primary_score(
         fold_count=5,
         params=[],
     )
-    job_store.update(job)
+    seed_job(job_store, job)
 
     res = client.get("/api/jobs/")
     assert res.status_code == 200
@@ -332,7 +333,7 @@ def _create_completed_job_with_model(
         fold_count=5,
         params=[],
     )
-    job_store.update(job)
+    seed_job(job_store, job)
     return job.job_id
 
 
@@ -412,7 +413,7 @@ def test_export_code_no_model_path(
     job.status = "completed"
     job.fit_result = FitSummary(metrics={"auc": 0.9}, fold_count=5, params=[])
     # Intentionally NOT setting model_path
-    job_store.update(job)
+    seed_job(job_store, job)
 
     res = client.get(f"/api/jobs/{job.job_id}/export-code")
     assert res.status_code == 400
@@ -439,12 +440,14 @@ def test_cancel_running_job(client: TestClient, sample_data_ref: DataRef) -> Non
         data_ref=sample_data_ref,
         job_type="fit",
     )
-    job.status = "running"
-    job_store.update(job)
+    # P-0119: a running job is an admitted run (live token); the cancel sets
+    # CANCEL for its commit. A token-less ``running`` row is not reachable.
+    admit_running(job_store, job)
 
     res = client.post(f"/api/jobs/{job.job_id}/cancel")
     assert res.status_code == 200
     assert res.json()["status"] == "cancelled"
+    assert job_store.is_cancel_requested(job.job_id) is True
 
 
 def test_cancel_non_running_job_rejected(
@@ -479,8 +482,8 @@ def test_cancel_paused_tune_transitions_to_cancelled(
         data_ref=sample_data_ref,
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
-    job_store.set_status(job.job_id, "paused")
+    seed_status(job_store, job.job_id, "running")
+    seed_status(job_store, job.job_id, "paused")
     job_store.claim_active(job.job_id)
     assert job_store.active_job_id == job.job_id
 
@@ -510,8 +513,17 @@ def test_pause_running_tune_returns_pause_requested(
         data_ref=sample_data_ref,
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
+    # P-0119 (pause: accepted only for a live run token with no CANCEL): a
+    # row seeded ``running`` with no run behind it is refused with 400; the
+    # same job admitted as a real run accepts the pause. Before P-0119 the
+    # seeded ``running`` row alone was enough for a 200.
+    seed_status(job_store, job.job_id, "running")
+    res = client.post(f"/api/jobs/{job.job_id}/pause")
+    assert res.status_code == 400, res.text
+    assert res.json()["error"]["code"] == "JOB_NOT_RUNNING"
+    assert job_store.is_pause_requested(job.job_id) is False
 
+    admit_running(job_store, job)
     res = client.post(f"/api/jobs/{job.job_id}/pause")
     assert res.status_code == 200, res.text
     assert res.json()["status"] == "pause_requested"
@@ -528,7 +540,7 @@ def test_pause_fit_job_rejected(client: TestClient, sample_data_ref: DataRef) ->
         data_ref=sample_data_ref,
         job_type="fit",
     )
-    job_store.set_status(job.job_id, "running")
+    seed_status(job_store, job.job_id, "running")
 
     res = client.post(f"/api/jobs/{job.job_id}/pause")
     assert res.status_code == 400
@@ -564,8 +576,8 @@ def test_pause_already_paused_rejected(
         data_ref=sample_data_ref,
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
-    job_store.set_status(job.job_id, "paused")
+    seed_status(job_store, job.job_id, "running")
+    seed_status(job_store, job.job_id, "paused")
 
     res = client.post(f"/api/jobs/{job.job_id}/pause")
     assert res.status_code == 400
@@ -603,8 +615,8 @@ def test_unpause_paused_tune_clears_flag_and_starts_worker(
         data_ref=sample_data_ref,
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
-    job_store.set_status(job.job_id, "paused")
+    seed_status(job_store, job.job_id, "running")
+    seed_status(job_store, job.job_id, "paused")
     job_store.claim_active(job.job_id)
     job_store.request_pause(job.job_id)
     assert job_store.is_pause_requested(job.job_id) is True
@@ -630,11 +642,23 @@ def test_unpause_paused_tune_clears_flag_and_starts_worker(
     assert res.status_code == 200, res.text
     assert res.json()["status"] == "unpause_started"
 
+    # P-0119 (受付: "受付は running を書き、PAUSE ... を消し"): the PAUSE flag
+    # is cleared by the admission at the launcher entry, not by the route.
+    # The launcher is faked here, so the route hands it the reset generation
+    # it captured on receipt, and that admission clears the flag.
+    assert "job" in captured
+    assert captured["job"].job_id == job.job_id  # type: ignore[union-attr]
+    assert captured["resume_from_existing_study"] is True
+    assert captured["reset_gen"] == job_store.capture_reset_gen()
+    job_store.admit(
+        job.job_id,
+        expect="paused",
+        reset_gen=captured["reset_gen"],  # type: ignore[arg-type]
+        slot_rule="own",
+    )
     assert job_store.is_pause_requested(job.job_id) is False, (
         "Unpause must clear the pause flag before the worker re-runs"
     )
-    assert "job" in captured
-    assert captured["job"].job_id == job.job_id  # type: ignore[union-attr]
 
 
 def test_unpause_non_paused_rejected(
@@ -648,7 +672,7 @@ def test_unpause_non_paused_rejected(
         data_ref=sample_data_ref,
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
+    seed_status(job_store, job.job_id, "running")
 
     res = client.post(f"/api/jobs/{job.job_id}/unpause")
     assert res.status_code == 400
@@ -676,8 +700,8 @@ def test_unpause_without_loaded_data_rejected(
         data_ref=sample_data_ref,
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
-    job_store.set_status(job.job_id, "paused")
+    seed_status(job_store, job.job_id, "running")
+    seed_status(job_store, job.job_id, "paused")
 
     res = client.post(f"/api/jobs/{job.job_id}/unpause")
     assert res.status_code == 400

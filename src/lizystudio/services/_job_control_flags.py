@@ -30,6 +30,13 @@ from lizystudio.services._job_metadata import JobMetadataStore
 _logger = logging.getLogger(__name__)
 
 
+class FlagNotPersistedError(OSError):
+    """A cancel / pause flag file could not be written (P-0119, Codex r2-2).
+
+    The request is not acknowledged: the in-memory flag is not set either.
+    """
+
+
 class JobControlFlags:
     """Cancel + pause request flags for jobs. Thread-safe.
 
@@ -57,48 +64,47 @@ class JobControlFlags:
     def request_cancel(self, job_id: str) -> None:
         """Mark a job for cancellation (H-0011).
 
-        Issue #152: also writes ``<job_dir>/CANCEL`` atomically so a
-        fresh ``JobStore`` constructed in a subprocess child (whose
-        in-memory ``_cancel_requested`` set is disjoint) can observe
-        the cancel through ``is_cancel_requested``. The in-memory
-        set remains the source of truth for same-process callers;
-        the file is an IPC channel only.
+        Issue #152: writes ``<job_dir>/CANCEL`` atomically so a fresh
+        ``JobStore`` in a subprocess child (whose in-memory set is disjoint)
+        observes the cancel, and so an accepted cancel survives a restart
+        (P-0119 INV-LC-4). P-0119 (Codex r2-2): the file is written first and
+        a failed write raises :class:`FlagNotPersistedError` with the
+        in-memory flag left unset, so a cancel is never acknowledged without
+        its durable record. A job whose directory does not exist (deleted, or
+        never created) has nothing durable to protect: only the in-memory
+        flag is set.
         """
+        self._persist_flag(job_id, self._cancel_flag_path(job_id), "cancel")
         with self._cancel_lock:
             self._cancel_requested.add(job_id)
-        # Best-effort file write. Only write if the job_dir already
-        # exists — do NOT mkdir it, because that would race with a
-        # concurrent delete() of the same job (re-creating the dir
-        # while rmtree enumerates it). The in-memory flag remains the
-        # source of truth for same-process callers; the file is only
-        # needed for subprocess children, which always run after the
-        # job_dir was persisted.
-        #
-        # Place the staging tempfile in jobs_dir (the parent, never
-        # deleted by delete(job_id)) rather than the job_dir itself,
-        # so a concurrent shutil.rmtree never observes a partially
-        # written or intermittent .tmp entry under the victim
-        # directory — that was the root cause of a FileNotFoundError
-        # surfaced in the concurrent cancel + delete test on 3.11.
-        tmp_path: Path | None = None
+
+    def mark_cancel_in_memory(self, job_id: str) -> None:
+        """Set only the in-memory cancel flag (the delete path, whose job
+        directory is about to be removed; its worker still sees the flag)."""
+        with self._cancel_lock:
+            self._cancel_requested.add(job_id)
+
+    def _persist_flag(self, job_id: str, flag_path: Path, kind: str) -> None:
+        """Atomically create *flag_path* (staged in ``jobs_dir``, never in the
+        job dir, so a concurrent ``rmtree`` never sees a partial entry).
+
+        No-op when the job dir does not exist (no ``mkdir``: that would race a
+        concurrent delete). Any other failure raises FlagNotPersistedError.
+        """
+        if not flag_path.parent.exists():
+            return
+        tmp_path = self._metadata.jobs_dir / f".{kind}-{job_id}-{os.getpid()}.tmp"
         try:
-            flag_path = self._cancel_flag_path(job_id)
-            if not flag_path.parent.exists():
-                return
-            tmp_path = self._metadata.jobs_dir / f".cancel-{job_id}-{os.getpid()}.tmp"
             tmp_path.write_bytes(b"")
             os.replace(tmp_path, flag_path)
-        except (OSError, ValueError):
-            # OSError: concurrent delete race / filesystem issue.
-            # ValueError: malformed job_id rejected by validate_path_within.
-            # Clean up any orphaned tmp file so a failed replace does
-            # not leak under jobs_dir.
-            if tmp_path is not None:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink(missing_ok=True)
-            _logger.warning(
-                "Failed to write cancel flag for job %s", job_id, exc_info=True
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            _logger.error(
+                "event='lifecycle.flag_not_persisted' job=%s flag=%s", job_id, kind
             )
+            msg = f"could not persist the {kind} flag of job {job_id}: {exc}"
+            raise FlagNotPersistedError(msg) from exc
 
     def is_cancel_requested(self, job_id: str) -> bool:
         """Check whether cancellation was requested for a job.
@@ -147,35 +153,15 @@ class JobControlFlags:
     def request_pause(self, job_id: str) -> None:
         """Mark a job for pause (R-1.4 / Issue #360).
 
-        Mirrors :meth:`request_cancel`: the in-memory set is the source
-        of truth for same-process callers, and ``<job_dir>/PAUSE`` is the
-        IPC channel a subprocess child reads through its own fresh
-        :class:`JobStore`. The cancel-aware callback raises
-        ``PausedError`` instead of ``CancelledError`` when this
-        observation fires, and ``_run_job_core`` catches it on a branch
-        that KEEPS ``active_job_id`` so the same job id can be resumed
-        in place (slot ownership extension to INV-1).
+        Mirrors :meth:`request_cancel`: ``<job_dir>/PAUSE`` is the IPC channel
+        a subprocess child reads, written first; a failed write raises
+        :class:`FlagNotPersistedError` with the in-memory flag left unset, so
+        a pause is never acknowledged without it (P-0119, Codex r2-2). The
+        cancel-aware callback raises ``PausedError`` when it observes it.
         """
+        self._persist_flag(job_id, self._pause_flag_path(job_id), "pause")
         with self._pause_lock:
             self._pause_requested.add(job_id)
-        # Best-effort file write. Same job_dir-must-exist guard and
-        # tmp-in-jobs_dir staging as request_cancel — see that method's
-        # comment for the concurrent-delete-race rationale.
-        tmp_path: Path | None = None
-        try:
-            flag_path = self._pause_flag_path(job_id)
-            if not flag_path.parent.exists():
-                return
-            tmp_path = self._metadata.jobs_dir / f".pause-{job_id}-{os.getpid()}.tmp"
-            tmp_path.write_bytes(b"")
-            os.replace(tmp_path, flag_path)
-        except (OSError, ValueError):
-            if tmp_path is not None:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink(missing_ok=True)
-            _logger.warning(
-                "Failed to write pause flag for job %s", job_id, exc_info=True
-            )
 
     def is_pause_requested(self, job_id: str) -> bool:
         """Check whether a pause request has been observed.

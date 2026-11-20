@@ -29,6 +29,7 @@ from lizystudio.backends.types import DataRef
 from lizystudio.server import create_app
 from lizystudio.services.jobs import JobStore
 from lizystudio.services.training import run_fit
+from tests.lifecycle_seed import admitted_sink
 
 pytestmark = pytest.mark.integration
 
@@ -64,6 +65,7 @@ def exported(
         backend=LizyMLAdapter(),
         config=config,
         dataframe=df,
+        sink=admitted_sink(job_store, job, None),
     )
     assert done.status == "completed", done.error
 

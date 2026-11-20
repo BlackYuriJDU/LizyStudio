@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.integration
 
@@ -38,7 +39,7 @@ def _create_completed_job_with_model(
     job.status = "completed"
     job.model_path = model_path
     job.fit_result = FitSummary(metrics={"auc": 0.95}, fold_count=5, params=[])
-    job_store.update(job)
+    seed_job(job_store, job)
     return job.job_id
 
 
@@ -92,7 +93,7 @@ def test_job_list_shows_sanitized_error(
     )
     job.status = "failed"
     job.error = "ValueError: bad\nTraceback (most recent call last):\n  File..."
-    job_store.update(job)
+    seed_job(job_store, job)
 
     res = client.get("/api/jobs/")
     assert res.status_code == 200
@@ -181,7 +182,7 @@ def test_delete_job_store_returns_false(
         job_type="fit",
     )
     job.status = "completed"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     # Simulate race: get() finds the job, but delete() reports an empty
     # removal list (H-0062 lineage delete shape).
@@ -210,7 +211,7 @@ def test_job_summary_no_raw_metrics(
     job.status = "completed"
     # metrics without 'raw' key
     job.fit_result = FitSummary(metrics={"auc": 0.9}, fold_count=5, params=[])
-    job_store.update(job)
+    seed_job(job_store, job)
 
     res = client.get("/api/jobs/")
     jobs = res.json()
@@ -230,7 +231,7 @@ def test_job_summary_empty_oof(client: TestClient, sample_data_ref: DataRef) -> 
     )
     job.status = "completed"
     job.fit_result = FitSummary(metrics={"raw": {"oof": {}}}, fold_count=5, params=[])
-    job_store.update(job)
+    seed_job(job_store, job)
 
     res = client.get("/api/jobs/")
     jobs = res.json()

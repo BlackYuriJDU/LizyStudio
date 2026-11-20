@@ -50,6 +50,7 @@ from lizystudio.services.training import (
     _build_optuna_study_name,
     run_tune,
 )
+from tests.lifecycle_seed import admitted_sink
 
 pytestmark = pytest.mark.unit
 
@@ -201,6 +202,7 @@ def test_unpause_calls_tune_once_with_resume_and_the_jobs_study(
         config=config,
         dataframe=object(),
         resume_from_existing_study=True,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert done.status == "completed"
@@ -232,6 +234,7 @@ def test_unpause_of_a_study_the_backend_cannot_continue_fails_the_job(
         config=_tune_config(4),
         dataframe=object(),
         resume_from_existing_study=True,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert done.status == "failed"
@@ -354,6 +357,7 @@ def test_initial_tune_path_unchanged_without_resume_flag(job_store: JobStore) ->
         config=_tune_config(target_n_trials),
         dataframe=object(),
         # Default: resume_from_existing_study=False
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert len(backend.tune_calls) == 1

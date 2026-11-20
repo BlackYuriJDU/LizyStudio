@@ -23,6 +23,8 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.lifecycle_seed import seed_job
+
 
 @pytest.fixture()
 def fake_importance_job(client: TestClient) -> Iterator[str]:
@@ -47,7 +49,7 @@ def fake_importance_job(client: TestClient) -> Iterator[str]:
         job_type="fit",
     )
     job.status = "completed"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     # Stub backend.importance: 3000 features, descending importance.
     fake_backend = MagicMock()
@@ -151,7 +153,7 @@ def test_importance_payload_cap_falls_back_to_top_n_with_header(
         job_type="fit",
     )
     job.status = "completed"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     # 5000 features, ~25 chars per name + 8 chars per float number => >130KB.
     payload = {f"feature_{i:05d}_name": float(5000 - i) for i in range(5000)}

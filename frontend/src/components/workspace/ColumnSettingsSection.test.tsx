@@ -5,13 +5,12 @@ import type { ColumnInfo } from "@/api/types";
 import { ColumnSettingsSection } from "./ColumnSettingsSection";
 
 /**
- * jsdom always reports zero-sized clientRects, which means
- * @tanstack/react-virtual measures the scroll viewport as 0 and would
- * either render nothing or fall back to mounting every row depending
- * on the version. Stub a non-zero size on the scroll element so the
- * virtualizer's measurement path matches what real browsers see, and
- * the wide-DataFrame guard tests can assert "fewer rows than columns
- * mounted at any one time".
+ * The DOM test environment reports zero sizes for every element.
+ * @tanstack/virtual-core >= 3.19.6 measures the scroll viewport with
+ * clientWidth/clientHeight and each row with offsetHeight. Stub both so
+ * the viewport is 320px and every row 32px (ROW_HEIGHT_PX), as in a
+ * real browser. A 0px row would make every column fit in the viewport
+ * and mount all of them at once.
  */
 beforeAll(() => {
   Object.defineProperty(HTMLElement.prototype, "clientHeight", {
@@ -24,6 +23,12 @@ beforeAll(() => {
     configurable: true,
     get() {
       return 800;
+    },
+  });
+  Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+    configurable: true,
+    get() {
+      return 32;
     },
   });
   Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
@@ -289,11 +294,6 @@ describe("ColumnSettingsSection wide-DataFrame virtualization (PR-B2)", () => {
   }
 
   it("uses the virtualized list path above the column threshold", () => {
-    // happy-dom returns 0 for getBoundingClientRect on refs, so the
-    // virtualizer will not actually mount any rows under test. Assert
-    // on the structural marker (the dedicated scroll container + the
-    // total-height spacer) instead, which still proves the virtual
-    // branch was taken.
     renderWide(makeWide(5000));
     const scroll = document.querySelector(
       '[data-testid="column-virtual-scroll"]',
@@ -303,6 +303,19 @@ describe("ColumnSettingsSection wide-DataFrame virtualization (PR-B2)", () => {
     );
     expect(scroll).not.toBeNull();
     expect(spacer).not.toBeNull();
+  });
+
+  it("mounts only a viewport-sized window of rows, not every column", () => {
+    // With the 320px viewport and 32px rows stubbed above, the
+    // virtualizer mounts about 10 visible rows plus overscan. Mounting
+    // every column (the failure seen when rows measured 0px under
+    // @tanstack/virtual-core >= 3.19.6) would put 5000 rows here.
+    renderWide(makeWide(5000));
+    const mounted = document.querySelectorAll(
+      '[data-testid="column-virtual-spacer"] > [data-index]',
+    ).length;
+    expect(mounted).toBeGreaterThan(0);
+    expect(mounted).toBeLessThan(100);
   });
 
   it("preserves the total scroll height proportional to column count", () => {

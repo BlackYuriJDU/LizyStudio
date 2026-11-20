@@ -34,6 +34,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.lifecycle_seed import seed_job
+
 pytestmark = pytest.mark.integration
 
 
@@ -85,7 +87,7 @@ def _seed_running_holder(job_store: Any) -> str:
         job_type="fit",
     )
     holder.status = "running"
-    job_store.update(holder)
+    seed_job(job_store, holder)
     assert job_store.claim_active(holder.job_id)
     return holder.job_id
 
@@ -194,7 +196,7 @@ def test_put_config_succeeds_when_holder_is_terminal_but_slot_not_yet_released(
         holder_job = job_store.get(holder_id)
         assert holder_job is not None
         holder_job.status = terminal_status  # type: ignore[assignment]
-        job_store.update(holder_job)
+        seed_job(job_store, holder_job)
         # Slot is still held by holder_id at this point — runner finally
         # has not run yet. The endpoint must still accept the write.
         res = client.put("/api/workspace/config", json=config)

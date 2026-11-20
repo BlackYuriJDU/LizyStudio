@@ -16,7 +16,8 @@ INV-3 declares the legal transitions for the Job state machine:
 This module pins the table itself as the canonical contract. The
 runtime assertion that rejects illegal transitions landed in v3-20c
 together with the ``request_pause`` / ``PausedError`` plumbing — see
-``JobStore.set_status`` and the matching test in
+the P-0119 status writer (formerly ``JobStore.set_status``) and the
+matching test in
 ``tests/regression/test_inv_pause_keeps_slot.py``.
 
 Why a table-as-test instead of a single big assertion: each entry in
@@ -37,6 +38,7 @@ import pytest
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import guarded_status
 
 pytestmark = pytest.mark.unit
 
@@ -72,10 +74,16 @@ NON_TERMINAL_STATES: frozenset[str] = JOB_STATUSES - TERMINAL_STATES
 # ``pending`` is a valid first state. We do not encode ``[*]`` rows
 # here because the test framework asserts the constructor invariant
 # separately.
+#
+# P-0119 adds ``pending -> failed``: startup ``recover`` of a CANCEL-less
+# ``pending`` row, and a reserved job whose launch fails before admission
+# (Decision 2026-11-20, #613). The runtime mirror is
+# ``services/_job_lifecycle_types.py:LEGAL_TRANSITIONS``.
 LEGAL_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
     {
         ("pending", "running"),
         ("pending", "cancelled"),
+        ("pending", "failed"),
         ("running", "completed"),
         ("running", "failed"),
         ("running", "cancelled"),
@@ -196,12 +204,13 @@ def test_no_self_loop_in_legal_transitions() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Runtime assertion (v3-20c: JobStore.set_status enforces LEGAL_TRANSITIONS).
+# Runtime assertion (v3-20c; P-0119: the primitive's status writer).
 # ---------------------------------------------------------------------------
 
 
 def test_runtime_guard_rejects_illegal_transitions(tmp_path: Path) -> None:
-    """``JobStore.set_status`` must raise ``AssertionError`` for any
+    """The P-0119 status writer (formerly ``JobStore.set_status``) must raise
+    ``AssertionError`` for any
     transition not present in :data:`LEGAL_TRANSITIONS`.
 
     Deeper coverage of the legal/illegal axes lives in
@@ -225,8 +234,8 @@ def test_runtime_guard_rejects_illegal_transitions(tmp_path: Path) -> None:
     )
 
     # Legal: pending -> running.
-    store.set_status(job.job_id, "running")
+    guarded_status(store, job.job_id, "running")
 
     # Illegal: running -> pending (audit-trail rewind).
     with pytest.raises(AssertionError):
-        store.set_status(job.job_id, "pending")
+        guarded_status(store, job.job_id, "pending")

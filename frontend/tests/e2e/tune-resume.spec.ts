@@ -123,8 +123,10 @@ test.describe("Tune pause / unpause flow (P-0099 v3-20g)", () => {
     const jobId = tuneBody.job_id as string;
     expect(jobId).toBeTruthy();
 
-    // Wait until the worker has actually claimed the slot — a /pause
-    // before status="running" would 400 with JOB_NOT_RUNNING.
+    // P-0119: admission writes status="running" in the /tune request, before
+    // the worker starts, so this returns at once and the pause below lands
+    // during setup; the worker stops at its first callback. (Before P-0119
+    // the worker claimed the slot and a /pause before that was 400.)
     await pollJobUntilStatus(request, jobId, "running", 30_000, 250);
 
     // ---- Pause ------------------------------------------------------------

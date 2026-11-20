@@ -16,17 +16,23 @@ from __future__ import annotations
 
 import copy
 import logging
-import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lizystudio.backends.base import BackendAdapter, ProgressCallback
 from lizystudio.backends.types import FitSummary, TuningSummary
+from lizystudio.services._job_lifecycle_types import (
+    AdmissionRefused,
+    ExpectedStatus,
+    RunToken,
+    SlotRule,
+)
+from lizystudio.services._job_sinks import OutcomeSink, ParentCommitSink, emit_effects
 from lizystudio.services._training_core import (  # noqa: F401
     _JOIN_TIMEOUT,
     CancelledError,
     PreviousJobStillRunningError,
-    _emit_terminal_metric,
+    _fail_escaped_job,
     _join_previous_thread,
     _make_cancel_aware_cb,
     _prepare_autofit_config,
@@ -35,6 +41,8 @@ from lizystudio.services._training_core import (  # noqa: F401
     _run_subprocess_job,
     _save_tuning_plot,
     _subprocess_duration_seconds,
+    record_outcome,
+    start_worker,
 )
 from lizystudio.services.jobs import Job, JobStore
 
@@ -54,8 +62,9 @@ def run_fit(
     dataframe: Any,
     params: dict[str, Any] | None = None,
     broadcaster: ProgressBroadcaster | None = None,
+    sink: OutcomeSink,
 ) -> Job:
-    """Execute a fit job synchronously. Updates job in-place and on disk."""
+    """Execute a fit job synchronously; the outcome goes to *sink* (P-0119)."""
 
     def execute(cb: ProgressCallback) -> tuple[FitSummary, TuningSummary | None, str]:
         model = backend.create_model(config, dataframe)
@@ -69,6 +78,7 @@ def run_fit(
         job_store=job_store,
         broadcaster=broadcaster,
         execute_fn=execute,
+        sink=sink,
     )
 
 
@@ -291,8 +301,12 @@ def run_tune(
     dataframe: Any,
     broadcaster: ProgressBroadcaster | None = None,
     resume_from_existing_study: bool = False,
+    sink: OutcomeSink,
 ) -> Job:
     """Execute a tune job: tune -> auto-fit with best params (H-0002 B).
+
+    The outcome goes to *sink* (P-0119): the parent's primitive in thread
+    mode, the legacy child writer in the subprocess child.
 
     ``resume_from_existing_study`` (Issue #554, R-1.4 INV-4) is the
     opt-in flag set by ``POST /jobs/{id}/unpause``. When True, the
@@ -306,11 +320,8 @@ def run_tune(
     The default ``False`` preserves the legacy single-shot behaviour
     for initial Tune jobs that POST through ``/api/tune``.
     """
-    tune_config = _prepare_tune_config(config)
-    re_tune = _extract_re_tune(config)
     # H-0062: checkpoint directory for incremental trial persistence.
     checkpoint_dir = job_store.job_dir(job.job_id)
-    _run_pickle_preflight(backend, checkpoint_dir)
     # P-0099 v3-20b: persistent Optuna storage per job. The job
     # directory is created lazily by the JobStore, so by the time
     # we hit lizyml's tuner the parent dir already exists for
@@ -318,15 +329,19 @@ def run_tune(
     storage_url = _build_optuna_storage_url(checkpoint_dir)
     study_name = _build_optuna_study_name(job.job_id)
 
-    # P-0109 PR-6b (Issue #527 re-enablement, ships with #554): warn-only
-    # INV-T3 drift assertion. The forward path through
-    # ``materialize_tuning_for_job`` already guarantees this contract;
-    # this check surfaces drift from non-API callers (raw YAML import,
-    # direct curl). Invocation was deferred while ``tune-resume.spec.ts``
-    # was flaky on the n_trials budget bug (#554), now fixed.
-    _assert_inv_t3(tune_config, backend, job_id=job.job_id)
-
     def execute(cb: ProgressCallback) -> tuple[FitSummary, TuningSummary | None, str]:
+        # Issue #612: the config preparation and the pickle preflight run
+        # inside the core, so an exception here fails the job and releases
+        # the active slot instead of escaping before ``_run_job_core``.
+        tune_config = _prepare_tune_config(config)
+        re_tune = _extract_re_tune(config)
+        _run_pickle_preflight(backend, checkpoint_dir)
+        # P-0109 PR-6b (Issue #527 re-enablement, ships with #554): warn-only
+        # INV-T3 drift assertion. The forward path through
+        # ``materialize_tuning_for_job`` already guarantees this contract;
+        # this check surfaces drift from non-API callers (raw YAML import,
+        # direct curl).
+        _assert_inv_t3(tune_config, backend, job_id=job.job_id)
         model = backend.create_model(tune_config, dataframe)
         tune_result: TuningSummary = backend.tune(
             model,
@@ -357,10 +372,92 @@ def run_tune(
         job_store=job_store,
         broadcaster=broadcaster,
         execute_fn=execute,
+        sink=sink,
     )
 
 
 # --- Async launchers (Phase 29: thread ownership in Service, not Router) ---
+
+
+def _admit_or_raise(
+    job_store: JobStore,
+    broadcaster: ProgressBroadcaster | None,
+    job: Job,
+    *,
+    expect: ExpectedStatus,
+    reset_gen: int,
+    slot_rule: SlotRule,
+) -> RunToken:
+    """Admit *job* at the launcher entry (P-0119), before the join.
+
+    A refusal is re-raised after emitting the settle it caused (a refused
+    reserved ``pending`` job is settled by the primitive).
+    """
+    try:
+        return job_store.admit(
+            job.job_id, expect=expect, reset_gen=reset_gen, slot_rule=slot_rule
+        )
+    except AdmissionRefused as exc:
+        emit_effects(job_store, broadcaster, exc.effects)
+        raise
+
+
+class _Run:
+    """One admitted run's worker body (thread target helpers, P-0119)."""
+
+    def __init__(
+        self,
+        ws: WorkspaceState,
+        job_store: JobStore,
+        broadcaster: ProgressBroadcaster,
+        token: RunToken,
+        job: Job,
+        epoch: int,
+    ) -> None:
+        self.ws = ws
+        self.job_store = job_store
+        self.broadcaster = broadcaster
+        self.token = token
+        self.job = job
+        self.epoch = epoch
+
+    def guarded(self, body: Any) -> None:
+        """Run *body*; an escaping exception fails the run through its token
+        (Issue #612, P-0119), never leaving the job or the slot behind."""
+        try:
+            body()
+        except Exception as exc:  # noqa: BLE001 — Issue #612: settle, never leak
+            _fail_escaped_job(
+                ws=self.ws,
+                job=self.job,
+                job_store=self.job_store,
+                broadcaster=self.broadcaster,
+                exc=exc,
+                epoch=self.epoch,
+                token=self.token,
+            )
+
+    def subprocess(self, **kwargs: Any) -> None:
+        _run_subprocess_job(
+            self.ws,
+            self.job,
+            self.job_store,
+            self.broadcaster,
+            token=self.token,
+            epoch=self.epoch,
+            **kwargs,
+        )
+
+    def thread(self, runner: Any, **kwargs: Any) -> None:
+        finished = runner(
+            job=self.job,
+            job_store=self.job_store,
+            backend=self.ws.backend,
+            broadcaster=self.broadcaster,
+            sink=ParentCommitSink(self.job_store, self.broadcaster, self.token),
+            **kwargs,
+        )
+        record_outcome(self.ws, finished, epoch=self.epoch)
 
 
 def start_fit_async(
@@ -371,40 +468,60 @@ def start_fit_async(
     config: dict[str, Any],
     dataframe: Any,
     job: Job,
+    reset_gen: int,
 ) -> str:
-    """Spawn a background thread for fit; update workspace state on completion."""
-    # P-0114: capture the reset generation before the join, so a reset
-    # during the join (or any time later) fences this launch's writes.
-    epoch = ws.current_epoch()
-    _join_previous_thread(ws)
+    """Admit *job*, then spawn its fit worker thread (P-0119).
 
+    *reset_gen* is the lifecycle reset generation the request captured with
+    its reservation (``create_and_reserve``); admission refuses a stale one
+    (INV-LC-6). Raises :class:`AdmissionRefused` and the join / start errors
+    (after aborting the admission).
+    """
+    # P-0114: capture the workspace reset generation before the join, so a
+    # reset during the join (or any time later) fences this launch's writes.
+    epoch = ws.current_epoch()
+    token = _admit_or_raise(
+        job_store,
+        broadcaster,
+        job,
+        expect="pending",
+        reset_gen=reset_gen,
+        slot_rule="reserved",
+    )
     from lizystudio.services.openmp_detect import should_use_subprocess
 
     use_subprocess = should_use_subprocess()
 
+    run = _Run(ws, job_store, broadcaster, token, job, epoch)
+
     def _run() -> None:
         if use_subprocess:
-            _run_subprocess_job(ws, job, job_store, broadcaster, epoch=epoch)
+            run.guarded(lambda: run.subprocess())
         else:
-            finished = run_fit(
-                job=job,
-                job_store=job_store,
-                backend=ws.backend,
-                config=config,
-                dataframe=dataframe,
-                broadcaster=broadcaster,
-            )
-            ws.record_completion(
-                fit_result=finished.fit_result,
-                tune_result=None,
-                job_id=finished.job_id,
-                epoch=epoch,
-            )
+            run.guarded(lambda: run.thread(run_fit, config=config, dataframe=dataframe))
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    ws.register_job_thread(t, epoch=epoch, job_id=job.job_id)
+    _launch(ws, job_store, broadcaster, token, _run, epoch)
     return job.job_id
+
+
+def _launch(
+    ws: WorkspaceState,
+    job_store: JobStore,
+    broadcaster: ProgressBroadcaster | None,
+    token: RunToken,
+    run: Any,
+    epoch: int,
+) -> None:
+    """:func:`start_worker` with this module's join (a test seam)."""
+    start_worker(
+        ws=ws,
+        job_store=job_store,
+        broadcaster=broadcaster,
+        token=token,
+        run=run,
+        epoch=epoch,
+        join=lambda w: _join_previous_thread(w),
+    )
 
 
 def start_tune_async(
@@ -415,53 +532,50 @@ def start_tune_async(
     config: dict[str, Any],
     dataframe: Any,
     job: Job,
+    reset_gen: int,
     resume_from_existing_study: bool = False,
 ) -> str:
-    """Spawn a background thread for tune; update workspace state on completion.
+    """Admit *job*, then spawn its tune worker thread (P-0119).
 
     ``resume_from_existing_study`` (Issue #554, R-1.4 INV-4) is set only
     by the unpause path, so :func:`run_tune` continues the persisted
     Optuna study instead of spending the trial budget again (P-0116 D3).
+    It also selects the admission: an unpause admits a ``paused`` job that
+    holds its own slot; a new tune admits its ``pending`` reservation.
     """
     # P-0114: captured per invocation (``/unpause`` re-enters with the same
     # job id) and before the join; see :func:`start_fit_async`.
     epoch = ws.current_epoch()
-    _join_previous_thread(ws)
-
+    unpause = resume_from_existing_study
+    token = _admit_or_raise(
+        job_store,
+        broadcaster,
+        job,
+        expect="paused" if unpause else "pending",
+        reset_gen=reset_gen,
+        slot_rule="own" if unpause else "reserved",
+    )
     from lizystudio.services.openmp_detect import should_use_subprocess
 
     use_subprocess = should_use_subprocess()
 
+    run = _Run(ws, job_store, broadcaster, token, job, epoch)
+    resume = resume_from_existing_study
+
     def _run() -> None:
         if use_subprocess:
-            _run_subprocess_job(
-                ws,
-                job,
-                job_store,
-                broadcaster,
-                resume_from_existing_study=resume_from_existing_study,
-                epoch=epoch,
-            )
+            run.guarded(lambda: run.subprocess(resume_from_existing_study=resume))
         else:
-            finished = run_tune(
-                job=job,
-                job_store=job_store,
-                backend=ws.backend,
-                config=config,
-                dataframe=dataframe,
-                broadcaster=broadcaster,
-                resume_from_existing_study=resume_from_existing_study,
-            )
-            ws.record_completion(
-                fit_result=finished.fit_result,
-                tune_result=finished.tune_result,
-                job_id=finished.job_id,
-                epoch=epoch,
+            run.guarded(
+                lambda: run.thread(
+                    run_tune,
+                    config=config,
+                    dataframe=dataframe,
+                    resume_from_existing_study=resume,
+                )
             )
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    ws.register_job_thread(t, epoch=epoch, job_id=job.job_id)
+    _launch(ws, job_store, broadcaster, token, _run, epoch)
     return job.job_id
 
 
@@ -475,7 +589,6 @@ def start_tune_async(
 
 from lizystudio.services.training_retune import (  # noqa: E402, F401
     _copy_checkpoint_to_child,
-    _mark_retune_child_failed,
     _run_retune_subprocess,
     run_retune,
     start_retune_async,

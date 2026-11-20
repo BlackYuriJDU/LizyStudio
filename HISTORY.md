@@ -5207,3 +5207,224 @@ lock を上げると、fixture の鮮度テストが落ちる（`tests/test_lizy
 - visual-qa が見つけた既存の 2 件は、別の Issue に起票した（milestone `backlog`）。
   - #753: Jobs ページが tablet と mobile の幅で崩れる。
   - #754: axe 違反 2 件。
+
+
+### P-0119: job の status・cancel flag・active slot を親の 1 つの遷移 primitive で動かす（Change Gate: 状態遷移・並行性と所有・共有状態の不変条件、Issue #613 / #697）
+
+Gate-category: state-machine, concurrency-ownership, shared-state-invariant
+
+本案は 3 区分すべてにあたる。受付と `running` の書き込みの位置を変える（状態遷移）。status・flag・slot の書き手を親の 1 か所にまとめる（所有）。「終端は書き換えない」と「受け付けた cancel は失われない」を lock と token で保証する（不変条件）。
+
+- **Date:** 2026-11-20 起票（proposed）
+- **Issue:** #613、#697（2026-11-20 の owner の判断で 1 つの Proposal にまとめる。#613 に記録）。親 Epic は #635
+- **Related:**
+  - P-0114（reset の世代番号。workspace の書き込みを fence する先例。本 Proposal は job の lifecycle 側を扱う）
+  - P-0099（`paused` と INV-1〜INV-7、INV-restart-1〜3）、#612 / PR #765（`_fail_escaped_job`）
+  - 範囲外で、後でこの primitive を使うもの: #621（orphan の子、fencing token）、#711（meta と sidecar の書き込み順）。#626（delete 後の復活など）も範囲外
+  - #613 と #697 に記録された、parked の lifecycle の設計草案（Issue 上で「draft P-0113」と呼ばれたもの。HISTORY の P-0113 は toolchain の別 entry で、無関係）
+- **影響調査:** 主文脈の静的な読みに加え、Codex の critique を 1 巡行った（8 件 major、3 件 minor。すべて `4b19421` の code で確かめ、採用した）。
+
+#### Motivation
+
+以下の行番号は develop `4b19421` のものである。Race A / B の実測は `7eb17cc` での in-memory の probe（実 `JobStore`、thread mode、backend は stub）による（#613 の 2026-11-20 のコメント）。`4b19421` では経路を読み直したが、probe はしていない。#697 の窓は code の読みと #697 の reconcile の再現による。
+
+**根本原因。** job の status、cancel / pause flag、active slot を、別々の actor が別々の process から書いている。共通の commit point も fencing もない。
+
+- API の request thread: cancel（`api/jobs.py:277-288`）、pause（`:322-328`）、unpause（`:368`、`:390`、`:392`）、delete（`:244-248`）、reset（`api/workspace.py:168-170`、`:193`、`:213-214`）、launch の失敗処理（`:712-727`、`:801-810`）
+- 親の worker thread: `_apply_job_outcome` の `running` と終端（`_training_core.py:267-316`）、`_run_job_core` の claim と finally（`:403`、`:429-435`）、`_fail_escaped_job`（`:204-224`）、`_mark_retune_child_failed`（`training_retune.py:143-150`）
+- 子 process: 自前の `JobStore`（`subprocess_runner.py:670`）で同じ status を書き、CANCEL file を消し、自分の process 内だけの slot を claim する。終端の frame（`:771-786`）は、親の commit より前に親から転送される（`:563-578`）
+- 親の supervisor: reconcile（`:336-360`）、`_run_subprocess_job`（`_training_core.py:568-575`、`:618-623`）
+- 起動時: `reconcile_at_startup`（`services/jobs.py:393-396`、`:408-414`、`:419`）。CANCEL file を見ずに `failed` を書く
+
+`set_status` は lock のない read-check-write である（`services/jobs.py:304-348`）。`update()` は、呼び出し側が memory に持つ `Job` 全体を `status` ごと上書きする（`_job_metadata.py:288-322`）。この上書きは warning の保存（`_job_warnings.py:224-226`）からも走る。各 actor は、自分の判断から書き込みまでの間に他の actor が変えた状態を見ない（DC8）。
+
+code を読むと、同じ形の穴がもう 1 つある（未実測）。retune / resume の子 job は `job_store.create` で作られ（`api/retune.py:180`、`:250`）、slot を取らない。thread mode では core の claim（`_training_core.py:154`、`:403`）で親の slot を取る。subprocess mode では親側に claim が無いので、親の slot が空のまま走る。reset は `active_job_id` だけで仕事を探す（`api/workspace.py:234-236`）。そのため、slot を取る前の retune の子は reset から見えない。
+
+前の検討は 4 巡の critique を受け、各巡で新しい窓が見つかった。そこから、条件を足していく形では閉じないと判断した。本案は書き手を 1 か所にまとめて原因を止める（設計上の主張）。
+
+#### Purpose（不変条件）
+
+BLUEPRINT の INV-1・INV-3・INV-5・INV-6・INV-restart-1 を、次の不変条件で締める。新しい ID の接頭辞は `INV-LC` とする。
+
+- **INV-LC-1:** 1 つの job について、受付を通った run は同時に高々 1 つである。違反: 同じ job id の worker が 2 つ起動する。
+- **INV-LC-2:** 終端は 1 度だけ書かれ、書き換えられない。終端の通知と metric は、その書き込みに従って 1 度だけ出る。違反: 終端のあとに別の status が書かれる。あるいは、書かれなかった終端の通知、または 2 度目の通知が出る。
+- **INV-LC-3:** 親の slot を持てるのは次の 3 つだけである（thread / subprocess の両方）。
+  - `pending` の予約: `create_and_claim_active` から受付まで。同じ request の中にある。
+  - 受付を通った live な run
+  - `paused` の job
+
+  違反: live な run の slot が空になる、または別の job が slot を持つ。例外は、Q1 の force-release の後の thread だけである。
+- **INV-LC-4:** API が 200 で受け付けた cancel は失われず、再起動を越えても残る。それより後に書かれる終端は `cancelled` である。違反: cancel に 200 を返した job が、`failed`・`completed`・`paused` で終わる。
+- **INV-LC-5:** 失効した token による操作は捨てられ、ログに残る。対象は、status の書き込み、slot の解放、flag の消去、通知、古い世代の outcome である。
+- **INV-LC-6:** reset が始まったあとは、それより前に取得された reset 世代の受付は通らない。
+
+#### Options
+
+##### (A) 親の `JobStore` に遷移 primitive と run token を置く（推奨）
+
+- **状態と lock。** 親の `JobStore` に lock を 1 つ置く。その下で次のものを動かす。
+  - status（`status`・`completed_at`・`error`）
+  - flag（memory と file）
+  - slot
+  - job ごとの run token（親の memory にある世代番号）
+  - lifecycle の reset 世代
+
+  status を変える書き込みは 3 種類しかない。
+  - **token なしの settle:** live な token が無く、status が `pending` / `paused` の job にだけ使う。
+  - **token の commit:** token が live なときにだけ通る。
+  - **起動時の `recover`:** process の起動時、API と launcher が動き出す前にだけ通る。再起動で memory の token はすべて消えているので、`running` の job にも token なしで終端を書く（下の「起動時 `recover`」）。起動の後は使えない。
+
+  warning と結果は、status に触れない項目別の書き込みにする。`update()` は status を書かない。
+- **受付 `admit`。** launcher の入口で行う。P-0114 の epoch を取得するのと同じ点で、join より前である（`training.py:380`、`:440`、`training_retune.py:232`）。
+  - 前提: 期待した status であること、CANCEL が無いこと、live な token が無いこと、受付に渡された reset 世代が今の値と一致すること。
+  - reset 世代は launcher の入口では取得しない。取得した値は、取得した request に属する不変の値として `admit` に引数で渡す。job の共有の欄には書かないので、後の request が上書きすることはない。取得する時点:
+    - `/fit`・`/tune`: `create_and_claim_active` と同じ lock の下。
+    - retune / resume の子: `job_store.create`（`api/retune.py:180`、`:250`）と同じ lock の下。
+    - unpause: request を受けた時点（`api/jobs.py:361`）。
+  - 作成または request の受信のあと、launcher を呼ぶまでの間に reset が走れば、その request の世代は古いので受付は通らない。世代は親の memory だけに持ち、保存しない。
+  - slot の条件: unpause は自分が持っていること（空の slot は claim しない）。`/fit`・`/tune` は予約を持っていること。retune / resume は、空なら claim する。
+  - 受付は `running` を書き、PAUSE と前の run の outcome を消し、token を発行する。
+  - 拒否されたら、`/unpause` は 400 `JOB_NOT_PAUSED`（status が `paused` でない）か 409（それ以外の前提）を返す。受付前の job は settle される。
+- **起動の門と巻き戻し。** join のあと、thread を起動する直前に、lock の下で token が live かを確かめる（`start`）。live でなければ起動しない。その終端は、token を失効させた操作がすでに書いている。受付のあと worker が動き出すまでに起きた失敗は、`abort(token)` で巻き戻す。対象は、join の失敗、data の欠如（`_training_core.py:568-575`、`training_retune.py:253-266`）、thread の起動の失敗である。CANCEL があれば `cancelled` を書く。無ければ、unpause は `paused` に戻して slot を保つ。それ以外は `failed` を書いて slot を解放する。`api/workspace.py:712-727`、`:801-810`、`_mark_retune_child_failed` は、この操作か commit に置き換える。
+- **worker（thread mode）。** claim も `running` の書き込みもしない（`_training_core.py:154-159`、`:267-268`、`:403` を削る）。終端と `paused` は `commit(token, outcome)` で書く。callback（`:90-93`）は、CANCEL・PAUSE・token の失効を見る。`_fail_escaped_job` は token を持つときだけ commit する。
+- **子（subprocess mode）。** 子は status・flag・slot に書かない。sidecar と model を書いたあと、outcome を job dir の一時ファイルに atomic に書く。outcome には、引数で渡された token の世代を入れる。親の reconcile は、世代が一致する outcome だけを commit する。outcome が無ければ、CANCEL を見て `cancelled` か `failed` を書く。親は、子の終端の frame（`completed`・`error`・`paused`）を転送しない。warning は JSONL で受け取り、親が保存する。
+- **通知と metric。** 終端か `paused` を実際に書いた操作（commit、settle、abort、force-release、recover）だけが、書き込みのあとで 1 度だけ出す。対象は、broadcast、P-0093 の replay、終端の metric である。`_training_core.py:433-435` と `:618-623` の無条件の metric は無くなる。
+- **cancel。** live な token があれば CANCEL を立てる。token の無い `pending` / `paused` は、settle で `cancelled` にし、slot を解放し、flag を消す。終端の job は 400 を返す。
+- **pause。** 受け付けるのは、live な token があり、CANCEL が無いときだけである。そのときは PAUSE を立てる。それ以外は 400 を返す。`paused` の commit は次のとおり。
+  - CANCEL があれば `cancelled` を書く。
+  - 無ければ、`paused` を書いて token を失効させ、slot を保ち、PAUSE を消す。
+  - PAUSE が立ったまま worker が `completed` を commit したら、`completed` を書いて PAUSE を消す。
+- **reset。** 1 つの lock の区間で、reset 世代を進めることと、active な job の cancel を一度に行う。cancel は、live な token があれば CANCEL を立てるだけにし、token の無い `pending` / `paused` は settle で `cancelled` にする。世代が古い request（slot を取る前の retune の子を含む）は受付を通れない。この区間の後に世代を取得した request は、すでに `cancelled` か CANCEL つきの job しか見ない。lock を出たあとで slot の解放を待ち、待っても解放されなければ `force_release` に進む。`force_release` は token を失効させ、終端でなければ `cancelled` を書き、slot を解放する。CANCEL は消さない（子が読むため）。
+- **force-release の後の重なり（Q1）。** subprocess mode では、親が CANCEL を見て子を止める（`subprocess_runner.py:495-505`）。10 秒で kill するので（`:286-296`）、12 秒の force-release の時点で子はほぼ終わっている。thread mode の失効した worker は、次の協調点まで計算を続ける。callback（`lifecycle_mixin.py:329`）を通った直後に失効した場合は、trial を 1 つ回す（`:335`）。bridge は、callback（`:315`）より前に checkpoint を保存する（`:283-290`）。どちらも古い job の dir の中で起きる。worker は何も commit せず、通知も出さない。次の trial は始めない。
+- **起動時 `recover`。** `reconcile_at_startup` を primitive に通す。CANCEL file のある `running` / `pending` / `paused` は `cancelled` にする。CANCEL の無い `running` / `pending` は `failed` にする。`paused` の生き残りは、token の無い slot の保持として戻す。memory の flag は再起動で消えるが、CANCEL file は job dir に残る（`_job_control_flags.py:84-90`）。
+- **影響範囲:** `services/jobs.py`、`_job_active_slot.py`、`_job_control_flags.py`、`_job_metadata.py`、`_job_warnings.py`、`_training_core.py`、`training.py`、`training_retune.py`、`subprocess_runner.py`、`api/jobs.py`、`api/workspace.py`、`api/retune.py`。
+
+##### (B) 永続する中間 status（`launching` / `resuming`）を足す
+
+- 受付で `paused → resuming` を書けば、二重の unpause と、古い読みの cancel は閉じる。
+- 欠点: `Job.status` の literal、`LEGAL_TRANSITIONS`、起動時の reconcile が変わる。API の enum、生成される frontend の型、UI、古い版との互換（P-0103）にも影響する見込みだが、読んでいない（未確認）。子の書き込み、reconcile、force-release の後の書き込み、通知の順序は fence できない。そのため (A) の lock と token がやはり要る。(A) は既存の `running` を受付で書くので、新しい status は要らない。
+
+##### (C) 箇所ごとの修正（unpause の CAS、paused cancel の flag、`set_status` の lock）
+
+- #613 本文の案である。前の検討の 4 巡は、この形に対して毎回新しい窓を見つけた。本 Proposal の critique で見つかった書き手（起動時、launch の失敗処理、子の終端の frame、reset から見えない retune）も、どれもこの形の外にある。subprocess mode は覆えない。
+
+#### 推奨案（A）で各ケースが閉じる理由
+
+| ケース | 変わる箇所 | 仕組み |
+|---|---|---|
+| Race A | `api/jobs.py:368-400`、`training.py:440-486` | 受付は join の前の CAS である。2 本目は join を待たずに 400 で拒否される。claim の冪等性（`_job_active_slot.py:150`）は使わない。並行する `update()` が無くなるので、`storage/versions.py:159-168` の衝突も無くなる |
+| Race B | `api/jobs.py:281-288`、`_training_core.py:267`、`:403` | cancel と受付は同じ lock の中にある。cancel が先なら受付が拒否され、受付が先なら cancel は flag を立てる |
+| 窓 1（古い読み） | `api/jobs.py:277-288` | 読みと書き込みが lock の中にある |
+| 窓 2（join 中の force-release） | `api/workspace.py:213-214`、`training.py:441` | force-release が token を失効させ、join のあとの起動の門で止まる |
+| 窓 3（受付後の force-release） | `api/workspace.py:213-214`、`_training_core.py:90-93` | token の失効と、1 回だけの `cancelled`。thread mode の計算は次の協調点まで続く（Q1） |
+| 窓 4（reconcile） | `subprocess_runner.py:336-360` | flag の確認、書き込み、flag の消去が、cancel と同じ lock の中にある |
+| #765 の片割れ | `_training_core.py:204-224` | 解放と消去は token を条件にする |
+| launch の失敗 | `api/workspace.py:712-727`、`:801-810`、`training_retune.py:143-150`、`_training_core.py:568-575` | `abort(token)` か settle に置き換える |
+| reset vs 予約前の retune | `api/workspace.py:234-236`、`training_retune.py:232` | reset 世代で受付を拒む |
+| subprocess の retune | `_training_core.py:618-623` | 受付が親の slot を claim する |
+| 子の終端の frame | `subprocess_runner.py:563-578` | 転送しない。親の commit が通知する |
+| 再起動 | `services/jobs.py:393-419` | `recover` が CANCEL を見て settle する |
+| #697 窓 1 | `subprocess_runner.py:343`、`:644-685` | 受付が `running` を書くので、親の commit が `cancelled` を書いて解放する |
+| #697 窓 2 | `_training_core.py:267-269`、`:429-431` | 子は status も CANCEL も書かず、親が flag を見て `cancelled` を書く |
+
+2 度目の SIGTERM（`subprocess_runner.py:618-634`）は変えない。次の記述を、実際の挙動に合わせる。
+- `:646-648` のコメント
+- INV-8 の記述（`tests/regression/test_reg_0153_sigterm_runs_finally.py:23-25`）。「no-op」と書いているが、実際は SIG_DFL に戻して終了する
+
+#697 の一覧にある「`run_tune` の準備」は、#765 で `execute` の中に移ったので、もう当てはまらない（`training.py:319-325`）。
+
+#### Compatibility
+
+- **API:**
+  - 応答の形は変わらない。
+  - 並行した 2 本目の unpause は、join を待たずに 400 `JOB_NOT_PAUSED` を返す。今は 200 を返し、worker が二重に起動する。受付が join の後にあると、2 本目は 1 本目の thread の join で 30 秒待ち、409 を返す。その順序を避けるため、受付を join の前に置いた。
+  - 受付後に join が失敗すると、409 `JOB_CONFLICT` を返し、job は `paused` に戻る。今の `unpause_job` にはこの処理が無い。
+  - token の無い `pending` への cancel は 200 で `cancelled` にする。
+  - 準備中の job は `running` になる。そのため Pause を受け付けて最初の callback で止まり、Delete は 409 で拒否される（`api/jobs.py:214`）。
+- **状態:** 受付後に受け付けた cancel は、worker が先に終わっていても `cancelled` になる（Q2）。再起動の前に cancel を受け付けた job は、`failed` ではなく `cancelled` になる（INV-restart-1 が変わる、Q6）。`paused` と CANCEL が同時に立つ状態は無くなる。
+- **通知:** subprocess mode の終端の frame は、子の exit と reconcile の後に親から出る。今より少し遅れる。
+- **保存形式:** `meta.json` の項目、status の literal、`format_version` は変わらない。次の 2 つが新しく生じる。
+  - job dir の一時的な outcome file。受付と commit で消す。
+  - force-release した終端の job の dir に、CANCEL file が残る場合がある。終端の job の flag は誰も読まない。
+- **UI（読んだのは `JobDetail.tsx:317`、`ResultsPanel.tsx:130-138`、`useJobProgress.ts:129-133` だけ）:**
+  - Pause は `running` の tune に出るので、準備中にも出る。
+  - `pending` の画面に Cancel は無い。`pending` は request の中の短い間だけになるので、ボタンは足さない。
+  - 生成される型は変わらない見込みである（未確認）。
+  - BLUEPRINT の INV-1 と INV-restart-1 の記述は、実装の PR で直す。
+- **#621 / #711 が使うもの:**
+  - #621: run token を fencing token として使う。子が status を書かないので、orphan が status を書き戻す経路は無い（process の後始末と sidecar は #621 に残る）。
+  - #711: commit を status の唯一の書き込み点として使い、sidecar をその前に書く。
+  - どちらも、本案のあとで追加の lock は要らない（設計上の主張）。
+
+#### Firing rate
+
+本案は skip / shorten / cache / select / allow / conditionally-activate のための条件を導入しない。受付の拒否と、失効した token の操作の破棄は、違法な遷移を fail-closed で拒む検査である。通常の処理を省いたり、近道を開いたりするものではない。
+
+#### Acceptance Criteria
+
+どのテストも DC8 の操作的な確認に従う。権限を得た actor を barrier で止め、介入する操作を行い、actor を放してから回数を数える。「両 mode」とあるものは thread と subprocess の両方で行う。
+
+**lock と優先順位（token を外しても落ちなくてよいもの）**
+
+- [ ] **Race A:** 1 本目の unpause を受付の後、join の中で止める。2 本目は待たずに 400 を返す。起動する worker（thread の起動、または `Popen`）は 1 つだけである（両 mode）
+- [ ] **Race B:** 受付を通った worker を最初の commit の前で止め、cancel を送る。cancel は 200 を返す。終端は `cancelled` で、書き込み、通知、metric、slot の解放はそれぞれ 1 回である。逆順では受付が拒否され、起動する worker は 0 である（両 mode）
+- [ ] **窓 1:** 受付を lock の中で止め、cancel を送る（cancel は待つ）。放したあと、worker を最初の callback の前で止め、cancel が 200 を返すのを待ってから放す。trial は 0 回で、終端は `cancelled` である
+- [ ] **窓 4:** subprocess mode で、2 つの順序を確かめる。reconcile の前の cancel は 200 を返し、終端は `cancelled` になる。reconcile を lock の中で止めて送った cancel は待ち、放すと 400 を返す。どちらも終端の書き込みは 1 回である
+- [ ] **pause:**
+  - pause と cancel が両方立つと `cancelled` になる。
+  - pause の後に `completed` が commit されると `completed` になり、PAUSE が消える。
+  - `paused` の commit の後、同じ token の commit は拒否される。
+  - `pending` / `paused` / 終端の job への pause は 400 を返す。
+- [ ] **launch の失敗:**
+  - unpause の受付の後で thread の起動を失敗させる。job は `paused` に戻り、slot は保たれ、token は失効する。その後の cancel は settle で `cancelled` になる。
+  - `/fit` の join を失敗させる。job は `failed` になり、slot の解放と metric は 1 回である。
+- [ ] **reset と予約:**
+  - `/fit` の job を予約から受付までの間で止め、reset を最後まで走らせる。job は `cancelled` になり、受付は拒否される。
+  - retune の子を作成の後、受付の前で止め、reset を最後まで走らせる。受付は reset 世代で拒否される。止める位置は 2 か所で確かめる: launcher の入口（`training_retune.py:232`）と、作成の後で launcher を呼ぶ前（`api/retune.py:180` と `:203` の間）。
+  - `recover` は起動の後に呼ぶと拒否される。
+  - unpause A が世代 g を取得して検証の中で待つ間に reset が g+1 に進め、同じ job への unpause B が g+1 を取得する。reset は世代を進めた同じ lock の区間で paused の job を `cancelled` に settle しているので、B は 400 `JOB_NOT_PAUSED` を返す。A を放すと、A の受付は g で拒否される。起動する worker は 0 で、`cancelled` の書き込みは 1 回である。
+  - どちらも起動する worker は 0 である。
+- [ ] **再起動:**
+  - cancel を受け付けた `running` の job を、新しい `JobStore` の `recover` に通す。`cancelled` になる。
+  - CANCEL のある `paused` は `cancelled` になり、slot は戻らない。
+  - CANCEL の無い `paused` の生き残りは、slot に戻る。
+- [ ] **#697 窓 1:** unpause した tune の子を `_child_main` の準備の中で止める。2 つの場合を確かめる。
+  - (a) reset を送る。job は `cancelled` になり、slot は force-release なしに解放され（reset は 12 秒より前に戻る）、metric は 1 回である。現行コードでは `paused` のまま残り、失敗する。
+  - (b) HTTP の cancel を送る。CANCEL が立ち、子に SIGTERM が届き、`cancelled` で終わる。現行コードでは API が flag なしに `cancelled` を書き、子が後から上書きして失敗する。
+
+  新規の job の子が準備中に死んだときの `execution.log` の扱いは、契約として BLUEPRINT に書く。
+- [ ] **#697 窓 2:** cancel を送ったあと、子の core の入口（outcome を書く前）に `KeyboardInterrupt` を入れる。終端は `cancelled` で、metric は 1 回である。現行コードの同じ位置（`_training_core.py:268` と `:269` の間）では `failed` になり、失敗する
+- [ ] **通知:** subprocess mode で、子が `completed` の frame を書いた後、親の commit の前に cancel を送る。WS に出る終端は `cancelled` の 1 回だけで、`completed` は出ない
+- [ ] **窓 2:** unpause を受付の後、`_join_previous_thread` の中で止め、reset を最後まで走らせる（12 秒の待ちの後の force-release を含む）。放したあと、`start` は失効した token を見て起動しない。起動する worker は 0 で、`cancelled` は 1 回だけ書かれる
+- [ ] **subprocess の retune の slot:** subprocess mode の retune が走る間、親の slot はその子 job が持つ。その間の `/tune` は 409 を返す。終わったら slot は 1 回だけ解放される
+
+**token と世代の fence（比較を無効にすると落ちるもの）**
+
+- [ ] **窓 3:** 2 つの場合を確かめる。worker を (a) `lifecycle_mixin.py:329` の callback の前、(b) その callback を通った直後、で止める。force-release を行い、別の `/tune` で slot を取ってから放す。
+  - (a) では trial は 0 回である。(b) では trial は高々 1 回で、次の trial は始まらない（thread mode）。
+  - どちらも、元の worker の commit、warning、通知、flag の消去は捨てられてログに残る。`cancelled` の書き込みは 1 回で、新しい job の slot と status は変わらない（両 mode）。
+- [ ] **#765 の片割れ:** 同じ id の新しい run が slot を持ち、cancel が保留されている間に、失効した token で `_fail_escaped_job` を呼ぶ。slot、CANCEL、status は変わらない。現行コードでは失敗する
+- [ ] **古い outcome:** 受付の後に、古い世代の outcome を job dir に置いてから、子を準備中に死なせる。CANCEL がある場合と無い場合を確かめる。古い outcome は捨てられてログに残り、終端はそれぞれ `cancelled` と `failed` になる
+- [ ] **競合する commit:** `completed`・`failed`・`cancelled` のそれぞれについて、commit の後に同じ token と失効した token で commit する。書き込み、通知、metric はそれぞれ 1 回である。失効した token による CANCEL / PAUSE の消去も拒否される
+- [ ] **fence を外す確認:** token と世代の比較を無効にすると、この区分のテストが落ちる
+
+**互換**
+
+- [ ] 2 本目の unpause が 400、join の失敗が 409、`pending` への cancel が 200 を返すことを API のテストで確かめる。`pnpm generate:api` の差分は空である。既存の `tune-resume.spec.ts` と `jobs-flow` の E2E は通る
+- [ ] `meta.json` の `status` を書くのが primitive だけであることを、テスト（`update()` は status を変えない）と、書き手の一覧の grep で確かめる
+- [ ] 2 度目の SIGTERM のテスト（INV-8）はそのまま通る。コメントと INV-8 の記述は、実際の挙動を述べている
+
+#### Decision
+
+- **2026-11-20 accepted**（owner）: Option A を採用する。Q1 は重なりを受け入れる（reset は今と同じく強制解放して戻る）。Q2〜Q6 は既定のとおりとする（Q2 `cancelled` を優先、Q3 一時ファイル、Q4 受付の時点で `running`、Q5 delete も primitive を通す、Q6 再起動の前に受け付けた cancel は `cancelled`）。
+- Codex の critique（lizy-reviewer、gpt-6.1-sol）: round 1 で major 8 件と minor 3 件、round 2 で major 1 件と minor 1 件、round 3 で major 1 件。上限の後の delta check（loop round 4）で APPROVE。各 round の前に loop monitor を通し、結果はすべて DELIVERABLE-FOCUSED または CONVERGING だった。
+- **2026-11-20 shipped**: PR #768（develop `5bb6b20`）。PR-A と PR-B を 1 つの PR にまとめた。PR-A 単独では、CI の e2e（subprocess mode）で子の status が親の commit より先に見え、unpause と retune が 409 になったため。実装の判断（retune / resume の 409 `JOB_CONFLICT`、setup 中の delete は 400 `JOB_RUNNING`、`pending -> failed` の合法化、Q2 で cancel が勝ったときも `record_completion` は結果なしで呼ぶ、結果を status より先に書く）は #613 に記録した。Codex の実装 review は 3 round と上限の後の delta check で APPROVE、CI は e2e を含めて緑。#613 と #697 は手動で close した。v0.8.1 で release。
+
+判断した問い（記録のため残す）:
+
+- **Q1（thread mode の force-release）:** 失効した thread は、次の協調点まで計算する。最悪の場合、trial 1 つと checkpoint の保存 1 回で、どちらも古い job の dir の中である。何も commit しない。この重なりを受け入れるか。あるいは、live な token の thread が生きている間は force-release を拒む（reset は 409 を返すか、待ち続ける）か。後者なら INV-LC-3 の例外は無くなる。
+- **Q2（終わった後の cancel）:** commit より先に 200 で受け付けた cancel は、結果が出ていても `cancelled` にするか（既定）。それとも、`completed` / `paused` を優先して INV-LC-4 を緩めるか。
+- **Q3（outcome の経路）:** 一時ファイルで渡すか（既定）、最後の JSONL message で渡すか。後者なら、progress file を消す時機（`subprocess_runner.py:313-314`）を commit の後に移す。
+- **Q4（新規の job の `running`）:** 受付の時点で `running` にしてよいか。あるいは `pending` のまま token だけを発行するか。
+- **Q5（delete）:** delete（`api/jobs.py:244-248`）の slot と flag の書き込みも、primitive に通すか（既定は通す。delete 後の復活は #626 に残す）。
+- **Q6（再起動の cancel）:** 再起動の前に cancel を受け付けていた job を、INV-restart-1 の `failed` ではなく `cancelled` にしてよいか（既定は `cancelled`）。
