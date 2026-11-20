@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Python 3.11 or later is required** (P-0120, #775). Python 3.10 reached its end of life in 2026-10. On Python 3.10, pip keeps installing the 0.8.x line, which continues to work there.
+  - Under Python 3.10, pandas resolves to 2.x. A past job whose model was saved under pandas 3 could then fail to open.
+
+### Changed
+
+- CI tests Python 3.11 and 3.12 on every PR, and 3.11 to 3.14 nightly. The required check `backend (3.10)` is replaced by `backend (3.12)`.
+
 ## [0.8.1] - 2026-11-20
 
 A job-lifecycle reliability release. Job status, the cancel and pause flags, and the active slot now move through one parent-side transition (P-0119, #613, #697). There is no API shape change, no dependency range change and no storage format change: `STUDIO_FORMAT_VERSION` stays at 2, and lizyml stays at `>=0.21.1,<0.22.0`.
