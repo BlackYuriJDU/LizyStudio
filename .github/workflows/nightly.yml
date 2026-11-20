@@ -295,6 +295,84 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # Issue #617: the @ci-flaky specs (session restore, reload re-attach,
+  # Pause/Resume) are excluded from PR CI's e2e jobs and used to run in no
+  # workflow at all. This lane runs them every active night, non-blocking,
+  # in its own job so the streak monitor tracks them apart from visual/a11y.
+  # They return to PR CI after 10 consecutive green runs (CLAUDE.md §7).
+  e2e-ci-flaky:
+    name: E2E ci-flaky (Nightly, non-blocking)
+    needs: guard
+    if: needs.guard.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: develop
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Enable corepack and activate pnpm from packageManager field
+        run: |
+          corepack enable
+          corepack prepare --activate
+          pnpm --version
+      - name: Install backend deps
+        working-directory: .
+        run: uv sync --locked
+      - run: pnpm install --frozen-lockfile
+      - name: Get Playwright version
+        id: pw-version
+        run: |
+          VERSION=$(node -e "console.log(require('@playwright/test/package.json').version)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run @ci-flaky E2E
+        env:
+          CI: "true"
+          LIZYSTUDIO_FILES_ROOT: /tmp
+          LIZYSTUDIO_JOBS_DIR: /tmp/e2e_jobs
+        run: |
+          rm -rf /tmp/e2e_jobs
+          pnpm exec playwright test \
+            --project=chromium \
+            --grep="@ci-flaky"
+      # Same retry-rescued trace capture as ci.yml `e2e-shard` (Issue #701):
+      # a pass that needed a retry is still evidence of the flake.
+      - name: Detect retried E2E tests
+        id: retried
+        if: success()
+        run: |
+          if [ -n "$(find test-results -name trace.zip -print -quit 2>/dev/null)" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload Playwright traces/screenshots on failure or retry
+        if: failure() || (!cancelled() && steps.retried.outputs.found == 'true')
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-ci-flaky
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
   mutation-test:
     # Issue #539 Phase 1: mutation testing for the JobStore state
     # machine (backend) + useConfigWriteFunnel (frontend). The score is
