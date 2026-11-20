@@ -1529,9 +1529,23 @@ HISTORY P-0119（2026-11-20 accepted, Option A; Q1 は重なりを受け入れ�
 
 ---
 
-## 採番ガイダンス（v3-27 以降）
+## Phase v3-28: P-0120 — Python の下限を 3.11 に上げる（Issue #775）
+
+HISTORY P-0120（2026-11-20 accepted）。Python 3.10（EOL 2026-10）を対応範囲から外し、lock した環境で pandas の major が分かれないようにする。pandas の下限は Studio に足さない。読めない job への 4xx は別の Issue で扱う。
+
+| サブフェーズ | 内容 | 状態 | PR |
+|---|---|---|---|
+| v3-28a | `requires-python >=3.11`・classifiers・ruff `py311`（`UP017` / `UP041` の書き換え）・PR matrix `[3.11, 3.12]`・Nightly matrix `[3.11..3.14]`・`uv.lock`・CONTRIBUTING / README / コメント・Ruleset の必須 check の差し替え | 🟡 実装中 | — |
+
+**DoD:**
+- [ ] P-0120 の Acceptance Criteria をすべて満たす
+- [ ] merge の後で最初の、変更のある夜の Nightly で backend の全脚が緑
+
+---
+
+## 採番ガイダンス（v3-28 以降）
 
 - 新規 Proposal は **P-0102** 以降を起票（P-0101 = 2026-05-05 metric-compat watchlist Decision、P-0099 = 2026-05-06 R-1 invariants）。
-- 仕様変更を伴う作業は HISTORY.md に Proposal → 本 PLAN.md にフェーズ追加（`v3-27` = P-0119、次は `v3-28`...）の順で進める。
+- 仕様変更を伴う作業は HISTORY.md に Proposal → 本 PLAN.md にフェーズ追加（`v3-27` = P-0119、`v3-28` = P-0120、次は `v3-29`...）の順で進める。
 - 詳細な未着手バックログは `docs/ROADMAP.md` を参照。
 - v0.6+ 候補: 第 2 backend (Issue #403)、Tailwind v4 (#125)、P-0087 Phase 3、LLM 統合、PyTorch backend、監査ログ・認証。
