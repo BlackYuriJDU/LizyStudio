@@ -171,3 +171,62 @@ def test_the_server_counts_and_replays_recovered_terminals(
         cached = state.broadcaster._last_terminal.get(orphan.job_id)
         assert cached is not None
         assert cached[1]["type"] == "error"
+
+
+# --- Codex r3: one failing recovery row does not lose the others' effects ---
+
+
+def _two_orphans(jobs_dir: Path) -> tuple[Any, Any]:
+    store = JobStore(jobs_dir)
+    first = seed_persisted_job(store, job_type="fit", status="running", data_ref=_REF)
+    second = seed_persisted_job(store, job_type="fit", status="running", data_ref=_REF)
+    return first, second
+
+
+def _fail_writes_for(monkeypatch: pytest.MonkeyPatch, job_id: str) -> None:
+    original = JobMetadataStore.write_status_locked
+
+    def flaky(meta: Any, target: str, status: str, **kwargs: Any) -> None:
+        if target == job_id:
+            raise OSError("synthetic disk failure")
+        original(meta, target, status, **kwargs)
+
+    monkeypatch.setattr(JobMetadataStore, "write_status_locked", flaky)
+
+
+def test_a_failing_recovery_row_keeps_the_other_rows_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex r3: row B's write fails. Row A's published terminal still
+    returns its effects; B stays non-terminal, and the next startup's
+    recover publishes B (and only B)."""
+    a, b = _two_orphans(tmp_path / "jobs")
+    _fail_writes_for(monkeypatch, b.job_id)
+    effects = JobStore(tmp_path / "jobs").recover()
+    assert [e.job_id for e in effects] == [a.job_id]
+    stored_b = JobStore(tmp_path / "jobs").get(b.job_id)
+    assert stored_b is not None
+    assert stored_b.status == "running"
+
+    monkeypatch.undo()
+    retry = JobStore(tmp_path / "jobs").recover()
+    assert [e.job_id for e in retry] == [b.job_id]
+
+
+def test_startup_survives_a_failing_recovery_row_and_emits_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex r3: the server still starts (the bad row is logged at ERROR),
+    and the recovered row's metric and replay frame are emitted."""
+    from lizystudio.server import create_app
+
+    jobs_dir = tmp_path / "jobs"
+    a, b = _two_orphans(jobs_dir)
+    _fail_writes_for(monkeypatch, b.job_id)
+    monkeypatch.setenv("LIZYSTUDIO_JOBS_DIR", str(jobs_dir))
+    with TestClient(create_app()) as client:
+        state: Any = client.app.state
+        failed = state.metrics.jobs_total.labels(job_type="fit", status="failed")
+        assert failed._value.get() == 1
+        assert a.job_id in state.broadcaster._last_terminal
+        assert b.job_id not in state.broadcaster._last_terminal

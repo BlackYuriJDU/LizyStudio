@@ -274,13 +274,11 @@ class LifecycleOps:
             if job.status in TERMINAL_STATUSES:
                 continue
             if self._flags.is_cancel_requested(job.job_id):
-                effects.append(self._recover_write_locked(job, "cancelled", None))
+                self._recover_one_locked(job, "cancelled", None, effects)
             elif job.status == "paused":
                 paused.append(job)
             else:
-                effects.append(
-                    self._recover_write_locked(job, "failed", _RESTART_FAILED)
-                )
+                self._recover_one_locked(job, "failed", _RESTART_FAILED, effects)
         return paused
 
     def _recover_paused_locked(
@@ -291,11 +289,34 @@ class LifecycleOps:
         paused.sort(key=lambda j: j.created_at, reverse=True)
         survivor = paused[0]
         for job in paused[1:]:
-            effects.append(self._recover_write_locked(job, "failed", _EXTRA_PAUSED))
+            self._recover_one_locked(job, "failed", _EXTRA_PAUSED, effects)
         self._slot.reattach(survivor.job_id)
         _logger.info(
             "Re-attached paused job %s to active slot at startup", survivor.job_id
         )
+
+    def _recover_one_locked(
+        self,
+        job: Job,
+        status: str,
+        error: str | None,
+        effects: list[LifecycleEffects],
+    ) -> None:
+        """Recover one row; its effects join *effects* only once published.
+
+        A row whose write fails is logged at ERROR and left non-terminal, so
+        the next startup retries it; the other rows are still recovered and
+        their effects returned (Codex r3). Startup is not aborted: one bad row
+        must not keep the server down.
+        """
+        try:
+            effects.append(self._recover_write_locked(job, status, error))
+        except Exception:  # noqa: BLE001 — logged; the next startup retries
+            _logger.exception(
+                "event='lifecycle.recover_row_failed' job=%s target=%s",
+                job.job_id,
+                status,
+            )
 
     def _recover_write_locked(
         self, job: Job, status: str, error: str | None
