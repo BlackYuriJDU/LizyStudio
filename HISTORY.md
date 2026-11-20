@@ -5418,6 +5418,7 @@ BLUEPRINT の INV-1・INV-3・INV-5・INV-6・INV-restart-1 を、次の不変�
 
 - **2026-11-20 accepted**（owner）: Option A を採用する。Q1 は重なりを受け入れる（reset は今と同じく強制解放して戻る）。Q2〜Q6 は既定のとおりとする（Q2 `cancelled` を優先、Q3 一時ファイル、Q4 受付の時点で `running`、Q5 delete も primitive を通す、Q6 再起動の前に受け付けた cancel は `cancelled`）。
 - Codex の critique（lizy-reviewer、gpt-6.1-sol）: round 1 で major 8 件と minor 3 件、round 2 で major 1 件と minor 1 件、round 3 で major 1 件。上限の後の delta check（loop round 4）で APPROVE。各 round の前に loop monitor を通し、結果はすべて DELIVERABLE-FOCUSED または CONVERGING だった。
+- **2026-11-20 shipped**: PR #768（develop `5bb6b20`）。PR-A と PR-B を 1 つの PR にまとめた。PR-A 単独では、CI の e2e（subprocess mode）で子の status が親の commit より先に見え、unpause と retune が 409 になったため。実装の判断（retune / resume の 409 `JOB_CONFLICT`、setup 中の delete は 400 `JOB_RUNNING`、`pending -> failed` の合法化、Q2 で cancel が勝ったときも `record_completion` は結果なしで呼ぶ、結果を status より先に書く）は #613 に記録した。Codex の実装 review は 3 round と上限の後の delta check で APPROVE、CI は e2e を含めて緑。#613 と #697 は手動で close した。v0.8.1 で release。
 
 判断した問い（記録のため残す）:
 

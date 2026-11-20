@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-20
+
+A job-lifecycle reliability release. Job status, the cancel and pause flags, and the active slot now move through one parent-side transition (P-0119, #613, #697). There is no API shape change, no dependency range change and no storage format change: `STUDIO_FORMAT_VERSION` stays at 2, and lizyml stays at `>=0.21.1,<0.22.0`.
+
+### Upgrade notes
+
+- **Some answers change** when a request races another one, or arrives while a job is still being set up. Clients that only call each endpoint once and wait for the job are not affected. The changed answers are listed under Changed.
+- **Stop running jobs before upgrading.** A job that is running or paused during the upgrade is settled by startup recovery when the new server starts.
+  - A job whose cancel had been accepted ends `cancelled`.
+  - A job that was running ends `failed`.
+  - A paused job stays paused.
+
+### Fixed
+
+- **Unpause, cancel and reset races (#613).** These could double-start a worker or bring a cancelled job back:
+  - Two concurrent `POST /jobs/{id}/unpause` requests start exactly one worker.
+  - A cancel of a paused job that races its unpause is no longer lost, and a cancelled job is never written back to `running`.
+  - Reset during a launch no longer lets the old launch run.
+- **SIGTERM during subprocess setup (#697).** A cancel or reset that stops a subprocess job while it is still setting up now ends it `cancelled` and releases the slot. Before, an unpaused tune could stay `paused`, holding the slot.
+- **A launcher thread that fails before or around the core releases the active slot (#612).** For example, a tune whose pickle preflight fails. Later `/fit` and `/tune` no longer get `JOB_CONFLICT` until a reset or restart.
+- **The subprocess child no longer writes job status.** It hands its outcome to the server, and the status becomes visible only when the server commits it. The terminal frame and the job metric are each sent once, after that commit.
+  - A client that reads `paused` and unpauses at once, or reads `completed` and starts a Re-tune at once, no longer gets 409.
+  - A `completed` job's result files exist before its status reads `completed`.
+- **Config writes (#614).** Each config write resolves with the PUT that carried it. Before, a burst of same-reason writes could resolve against a different PUT, and an earlier failure could be reported as a later success.
+- **Form renderer (#627).** Editing a field inside an array item keeps the array, and a union field shows the variant that matches its value.
+- **CLI (#737).** `lizystudio` keeps `LIZYSTUDIO_JOBS_DIR` and `LIZYSTUDIO_BACKEND` when they are already set. The precedence is: an explicit flag, then an existing variable, then the default.
+
+### Changed
+
+- **A second concurrent `POST /jobs/{id}/unpause`** answers 400 `JOB_NOT_PAUSED` at once.
+- **A new job is `running` from the moment it is admitted,** so Cancel works during setup. A cancel of a `pending` job is accepted.
+- **A cancel accepted before a job's terminal write wins:** the job ends `cancelled` even if its work had finished. The result files stay on disk.
+- **`POST /jobs/{id}/retune` and `/resume`** answer 409 `JOB_CONFLICT` when another job holds the active slot. They also claim the slot in subprocess mode, as `/fit` and `/tune` do.
+- **`POST /jobs/{id}/cancel` and `/pause`** answer 500 `CANCEL_NOT_PERSISTED` / `PAUSE_NOT_PERSISTED` when the flag file cannot be written. Before, they answered 200 for a cancel that a restart would lose.
+- **Startup recovery settles each stored job on its own.** A job whose write fails is logged and retried at the next start. Recovered terminal statuses are counted once and can be replayed by a client that reconnects.
+- **The server logs the worker mode at startup** (`event='server.worker_mode'`).
+
+### Internal
+
+- A non-blocking Nightly job runs the three `@ci-flaky` E2E specs, and the streak monitor tracks it (#617, #766).
+- Dependency updates: the prod minor/patch group (#747). TypeScript 7 is held for now (#762, #763). The radix var utilities use the Tailwind v4 paren form (#757).
+
 ## [0.8.0] - 2026-11-05
 
 The **lizyml 0.21** follow-up (P-0117, #748). LizyStudio moves from lizyml

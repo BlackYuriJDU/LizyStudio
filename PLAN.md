@@ -1515,8 +1515,8 @@ HISTORY P-0119（2026-11-20 accepted, Option A; Q1 は重なりを受け入れ�
 
 | サブフェーズ | 内容 | 状態 | PR |
 |---|---|---|---|
-| v3-27a (PR-A) | primitive（admit / start / commit / abort / settle / cancel / pause / reset / force_release / recover）と、親側のすべての書き手の付け替え。`update()` は status-free。子は 子の暫定の status writer に限定（`running` は書かない、flag と slot に触れない）。retune / resume の受付は slot が他の job に取られていれば 409 `JOB_CONFLICT`。`pending -> failed` を合法化。Q2 で cancel が勝つと sidecar は残し、workspace には結果を記録しない。完了は結果を status-free に書いてから status を commit | 🟡 実装済み（review 中） | #768 |
-| v3-27b (PR-B) | 子は status を書かず、run 世代つきの outcome file を書く。親は世代の一致する outcome だけを commit。子の暫定の status writer と子の終端 frame の転送を削除 | 🟡 実装済み（#768 に同梱） | #768 |
+| v3-27a (PR-A) | primitive（admit / start / commit / abort / settle / cancel / pause / reset / force_release / recover）と、親側のすべての書き手の付け替え。`update()` は status-free。子は 子の暫定の status writer に限定（`running` は書かない、flag と slot に触れない）。retune / resume の受付は slot が他の job に取られていれば 409 `JOB_CONFLICT`。`pending -> failed` を合法化。Q2 で cancel が勝つと sidecar は残し、workspace には結果を記録しない。完了は結果を status-free に書いてから status を commit | ✅ merged 2026-11-20 | #768 |
+| v3-27b (PR-B) | 子は status を書かず、run 世代つきの outcome file を書く。親は世代の一致する outcome だけを commit。子の暫定の status writer と子の終端 frame の転送を削除 | ✅ merged 2026-11-20（#768 に同梱） | #768 |
 
 **受け入れ（P-0119 Acceptance Criteria の 21 項目）:** PR-A の範囲で 16（Race A・Race B・窓1・窓4・pause・launch の失敗・reset と予約・再起動・#697 窓1・#697 窓2・窓2・subprocess の retune の slot・#765 の片割れ・競合する commit・互換 2 件）、PR-B で 5（窓3 の両 mode・通知・古い outcome・fence を外す確認・status の書き手の census）。
 
@@ -1525,7 +1525,7 @@ HISTORY P-0119（2026-11-20 accepted, Option A; Q1 は重なりを受け入れ�
 - [x] P-0119 の PR-A 項目のテスト（`tests/regression/test_reg_0613_*.py`、`test_reg_0697_child_windows.py`）が緑。先に develop に対して RED を取った
 - [x] 既存テストの期待の変更は P-0119 を引用して書き直した（削除なし）
 - [x] `pnpm generate:api` の差分が空（API の形は不変）
-- [ ] Codex review APPROVE、CI 緑
+- [x] Codex review APPROVE、CI 緑（3 round と delta check、develop `5bb6b20`。v0.8.1 で release）
 
 ---
 
