@@ -36,6 +36,7 @@ from lizystudio.services.training import (
     _build_optuna_study_name,
     run_tune,
 )
+from tests.lifecycle_seed import admitted_sink
 
 pytestmark = pytest.mark.integration
 
@@ -122,6 +123,7 @@ def _pause_then_unpause(
         config=config,
         dataframe=df,
         broadcaster=broadcaster,  # type: ignore[arg-type]
+        sink=admitted_sink(job_store, job, broadcaster),
     )
     assert paused.status == "paused", paused.error
     assert broadcaster.paused_frames == 1
@@ -141,6 +143,7 @@ def _pause_then_unpause(
         dataframe=df,
         broadcaster=broadcaster,  # type: ignore[arg-type]
         resume_from_existing_study=True,
+        sink=admitted_sink(job_store, paused, broadcaster),
     )
     return job_store, paused, done, storage, study_name
 

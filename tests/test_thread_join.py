@@ -18,6 +18,7 @@ from lizystudio.backends.types import DataRef, FitSummary, TuningSummary
 from lizystudio.services.jobs import JobStore
 from lizystudio.services.training import start_fit_async, start_tune_async
 from lizystudio.services.workspace import WorkspaceState
+from tests.lifecycle_seed import reserve_for_launch
 
 pytestmark = pytest.mark.unit
 
@@ -112,6 +113,7 @@ class TestThreadJoinOnNewJob:
             config={"task": "binary"},
             dataframe=sample_df,
             job=job,
+            reset_gen=reserve_for_launch(job_store, job),
         )
         assert ws._job_thread is not None
         assert isinstance(ws._job_thread, threading.Thread)
@@ -140,6 +142,7 @@ class TestThreadJoinOnNewJob:
             config={"task": "binary"},
             dataframe=sample_df,
             job=job,
+            reset_gen=reserve_for_launch(job_store, job),
         )
         assert ws._job_thread is not None
         assert isinstance(ws._job_thread, threading.Thread)
@@ -180,6 +183,7 @@ class TestThreadJoinOnNewJob:
             config={},
             dataframe=sample_df,
             job=job1,
+            reset_gen=reserve_for_launch(job_store, job1),
         )
         thread1 = ws._job_thread
         assert thread1 is not None
@@ -200,6 +204,7 @@ class TestThreadJoinOnNewJob:
             config={},
             dataframe=sample_df,
             job=job2,
+            reset_gen=reserve_for_launch(job_store, job2),
         )
         thread2 = ws._job_thread
         assert thread2 is not None
@@ -251,6 +256,7 @@ class TestThreadJoinOnNewJob:
                     config={},
                     dataframe=sample_df,
                     job=job,
+                    reset_gen=reserve_for_launch(job_store, job),
                 )
         finally:
             core_mod._JOIN_TIMEOUT = original_timeout
@@ -281,6 +287,7 @@ class TestThreadJoinOnNewJob:
                 config={},
                 dataframe=sample_df,
                 job=job,
+                reset_gen=reserve_for_launch(job_store, job),
             )
             # Wait for completion before next
             if ws._job_thread:

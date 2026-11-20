@@ -22,6 +22,7 @@ import ast
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -399,29 +400,6 @@ class _StubBroadcaster:
         return None
 
 
-class _StubJobStoreForSubprocess:
-    """JobStore stand-in exposing only what _run_subprocess_job touches."""
-
-    def __init__(self) -> None:
-        self.updates: list[object] = []
-        self.released: list[str] = []
-        self.terminals: list[tuple[str, str, float]] = []
-
-    def update(self, job: object) -> None:
-        self.updates.append(job)
-
-    def release_active(self, job_id: str) -> None:
-        self.released.append(job_id)
-
-    def record_job_terminal(
-        self, job_type: str, status: str, *, duration: float = 0.0
-    ) -> None:
-        self.terminals.append((job_type, status, duration))
-
-    def get(self, _job_id: str) -> object | None:
-        return None
-
-
 class _StubWsWithData:
     """WorkspaceState stub with a loaded data_ref."""
 
@@ -454,14 +432,13 @@ class _StubWsNoData:
         return None
 
 
-def _make_pending_tune_job() -> object:
-    """Construct a ``Job`` dataclass instance for these tests."""
+def _admitted_tune_job(tmp_path: Path) -> tuple[Any, Any, Any]:
+    """A real store with one reserved tune job and its admitted run token."""
     from lizystudio.backends.types import DataRef
-    from lizystudio.services.jobs import Job
+    from lizystudio.services.jobs import JobStore
 
-    return Job(
-        job_id="j1",
-        status="pending",
+    store = JobStore(tmp_path / "jobs")
+    reservation = store.create_and_reserve(
         backend_name="stub-backend",
         config={},
         data_ref=DataRef(
@@ -472,12 +449,17 @@ def _make_pending_tune_job() -> object:
             shape=(1, 1),
         ),
         job_type="tune",
-        created_at="2026-04-22T00:00:00+00:00",
     )
+    assert reservation is not None
+    job, gen = reservation
+    token = store.admit(
+        job.job_id, expect="pending", reset_gen=gen, slot_rule="reserved"
+    )
+    return store, job, token
 
 
 def test_run_subprocess_job_forwards_optional_kwargs_individually(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Each optional retune/resume kwarg is forwarded to
     ``run_job_in_subprocess`` only when set — covers the five branches
@@ -492,6 +474,7 @@ def test_run_subprocess_job_forwards_optional_kwargs_individually(
         captured.update(kwargs)
 
         class _Finished:
+            status = "completed"
             fit_result = None
             tune_result = None
             job_id = "j1"
@@ -501,12 +484,13 @@ def test_run_subprocess_job_forwards_optional_kwargs_individually(
     monkeypatch.setattr(sr, "run_job_in_subprocess", _fake_run)
     monkeypatch.setattr(ws_mod, "get_backend_name", lambda _ws: "stub-backend")
 
-    job_store = _StubJobStoreForSubprocess()
+    job_store, job, token = _admitted_tune_job(tmp_path)
     _training_core._run_subprocess_job(
         _StubWsWithData(),  # type: ignore[arg-type]
-        _make_pending_tune_job(),  # type: ignore[arg-type]
-        job_store,  # type: ignore[arg-type]
+        job,
+        job_store,
         _StubBroadcaster(),  # type: ignore[arg-type]
+        token=token,
         mode="retune",
         parent_job_id="parent-1",
         retune_n_trials=20,
@@ -520,11 +504,14 @@ def test_run_subprocess_job_forwards_optional_kwargs_individually(
     assert captured["retune_n_trials"] == 20
     assert captured["retune_expand_boundary"] is True
     assert captured["retune_boundary_threshold"] == 0.5
-    assert job_store.released == ["j1"]
+    # P-0119: the slot is released by the reconcile's commit of the token
+    # (inside ``run_job_in_subprocess``, faked here), not by a ``finally``
+    # of ``_run_subprocess_job``; the token is forwarded for that commit.
+    assert captured["token"] == token
 
 
 def test_run_subprocess_job_omits_none_kwargs(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Optional kwargs left at None are NOT forwarded — otherwise
     ``run_job_in_subprocess`` would receive ``mode=None`` and collide
@@ -539,6 +526,7 @@ def test_run_subprocess_job_omits_none_kwargs(
         captured.update(kwargs)
 
         class _Finished:
+            status = "completed"
             fit_result = None
             tune_result = None
             job_id = "j1"
@@ -548,11 +536,13 @@ def test_run_subprocess_job_omits_none_kwargs(
     monkeypatch.setattr(sr, "run_job_in_subprocess", _fake_run)
     monkeypatch.setattr(ws_mod, "get_backend_name", lambda _ws: "stub-backend")
 
+    job_store, job, token = _admitted_tune_job(tmp_path)
     _training_core._run_subprocess_job(
         _StubWsWithData(),  # type: ignore[arg-type]
-        _make_pending_tune_job(),  # type: ignore[arg-type]
-        _StubJobStoreForSubprocess(),  # type: ignore[arg-type]
+        job,
+        job_store,
         _StubBroadcaster(),  # type: ignore[arg-type]
+        token=token,
         epoch=0,
     )
 
@@ -563,27 +553,39 @@ def test_run_subprocess_job_omits_none_kwargs(
     assert "retune_boundary_threshold" not in captured
 
 
-def test_run_subprocess_job_fails_when_no_data_loaded() -> None:
+def test_run_subprocess_job_fails_when_no_data_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """WS error path: without a loaded dataset the job transitions to
     failed, the slot is released, a single terminal metric is recorded,
-    and the broadcaster observes a clear error message."""
+    and the broadcaster observes a clear error message.
+
+    P-0119: the failure is an ``abort`` of the admitted run token; the
+    store is a real ``JobStore`` (the stub had no primitive).
+    """
     from lizystudio.services import _training_core
 
-    job_store = _StubJobStoreForSubprocess()
+    job_store, job, token = _admitted_tune_job(tmp_path)
+    terminals: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        job_store,
+        "record_job_terminal",
+        lambda job_type, status, duration=0.0: terminals.append((job_type, status)),
+    )
     broadcaster = _StubBroadcaster()
 
     result = _training_core._run_subprocess_job(
         _StubWsNoData(),  # type: ignore[arg-type]
-        _make_pending_tune_job(),  # type: ignore[arg-type]
-        job_store,  # type: ignore[arg-type]
+        job,
+        job_store,
         broadcaster,  # type: ignore[arg-type]
+        token=token,
         epoch=0,
     )
 
-    assert result.status == "failed"  # type: ignore[attr-defined]
-    assert "No data loaded" in (result.error or "")  # type: ignore[attr-defined]
-    assert job_store.released == ["j1"]
-    assert any("No data loaded" in msg for _, msg, _ in broadcaster.errors)
-    # Exactly one terminal metric — finally-block must not double-count.
-    assert len(job_store.terminals) == 1
-    assert job_store.terminals[0][1] == "failed"
+    assert result.status == "failed"
+    assert "No data loaded" in (result.error or "")
+    assert job_store.active_job_id is None
+    assert sum("No data loaded" in msg for _, msg, _ in broadcaster.errors) == 1
+    # Exactly one terminal metric — the abort's effects, counted once.
+    assert terminals == [("tune", "failed")]

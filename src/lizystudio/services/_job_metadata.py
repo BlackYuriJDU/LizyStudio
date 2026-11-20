@@ -23,7 +23,7 @@ from __future__ import annotations
 import builtins
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -65,6 +65,7 @@ ArtifactKind = Literal[
     "tuning_plot",
     "cancel_flag",
     "pause_flag",
+    "outcome",
 ]
 
 ARTIFACT_FILENAMES: dict[ArtifactKind, str] = {
@@ -76,6 +77,8 @@ ARTIFACT_FILENAMES: dict[ArtifactKind, str] = {
     "tuning_plot": "tuning_plot.json",
     "cancel_flag": CANCEL_FLAG_FILENAME,
     "pause_flag": PAUSE_FLAG_FILENAME,
+    # P-0119 PR-B: the subprocess child's outcome, read by the parent.
+    "outcome": "outcome.json",
 }
 
 
@@ -145,8 +148,8 @@ class Job:
     # contract (legal transitions, slot ownership, terminal vs non-
     # terminal classification) is declared in
     # ``tests/regression/test_inv_state_machine.py``; runtime assertion
-    # of illegal transitions lives in ``JobStore.set_status`` alongside
-    # the ``request_pause`` / ``PausedError`` plumbing.
+    # of illegal transitions lives in the P-0119 lifecycle primitive's one
+    # status writer (``JobLifecycle._write_status_locked``).
     status: Literal[
         "pending",
         "running",
@@ -286,8 +289,49 @@ class JobMetadataStore:
         return jobs
 
     def update(self, job: Job) -> None:
-        """Persist updated job state to disk (meta + result sidecars)."""
+        """Persist results, model path and warnings — never the status.
+
+        P-0119: ``status``, ``completed_at`` and ``error`` are owned by the
+        lifecycle primitive; this write keeps the values already on disk, so
+        a caller's in-memory copy cannot rewind or skip a transition. The
+        caller (:meth:`JobStore.update`) holds the lifecycle lock, so the
+        read and the write see no concurrent status write. A job with no
+        ``meta.json`` yet is written as given.
+        """
+        self.save_meta(self._with_stored_status(job))
+        self._write_sidecars(job)
+
+    def write_status_locked(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        error: str | None,
+        completed_at: str | None,
+    ) -> None:
+        """Write the lifecycle fields of *job_id* (the primitive only).
+
+        Caller must hold the lifecycle lock (P-0119); every other field is
+        re-read from disk so the write changes nothing but the status.
+        """
+        job = self.load_job(job_id)
+        job.status = status  # type: ignore[assignment]
+        job.error = error
+        job.completed_at = completed_at
         self.save_meta(job)
+
+    def _with_stored_status(self, job: Job) -> Job:
+        if not self.path_for(job.job_id, "meta").exists():
+            return job
+        stored = read_job_json(self.path_for(job.job_id, "meta"))
+        return replace(
+            job,
+            status=stored["status"],
+            completed_at=stored.get("completed_at"),
+            error=stored.get("error"),
+        )
+
+    def _write_sidecars(self, job: Job) -> None:
         if job.fit_result is not None:
             write_job_json(
                 self.path_for(job.job_id, "fit_result"),

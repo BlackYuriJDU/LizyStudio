@@ -13,6 +13,7 @@ import pytest
 
 from lizystudio.backends.types import DataRef, FitSummary, TuningSummary
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -47,7 +48,7 @@ def _create_completed_job(store: JobStore) -> Job:
         fold_count=5,
         params=[{"lr": 0.01, "depth": 6}],
     )
-    store.update(job)
+    seed_job(store, job)
     return job
 
 
@@ -233,7 +234,7 @@ class TestRoundTrip:
             metric_name="accuracy",
             direction="maximize",
         )
-        store.update(job)
+        seed_job(store, job)
 
         reloaded = store.get(job.job_id)
         assert reloaded is not None

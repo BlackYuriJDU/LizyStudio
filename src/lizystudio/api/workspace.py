@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import tempfile
-import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any
@@ -18,6 +17,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel  # noqa: F401
 
 import lizystudio.security as security
+from lizystudio.api._lifecycle_http import launch_reserved, teardown_active_job
 from lizystudio.api.deps import get_broadcaster
 from lizystudio.api.errors import (
     ConfigImportError,
@@ -62,7 +62,6 @@ from lizystudio.services.data import (
 )
 from lizystudio.services.jobs import JobStore, get_job_store
 from lizystudio.services.training import (
-    PreviousJobStillRunningError,
     start_fit_async,
     start_tune_async,
 )
@@ -153,106 +152,30 @@ def workspace_status(
 _RESET_WAIT_TIMEOUT = 12.0
 _RESET_WAIT_INTERVAL = 0.05
 
-_TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled")
-
-
-def _request_cancel_if_running(job_store: JobStore, job_id: str) -> None:
-    """Signal cancellation for *job_id* unless it is already terminal.
-
-    Mirrors ``POST /jobs/{id}/cancel``: we set the cancel flag and rely on
-    the runner (in-process thread or subprocess poll loop) to flip the job
-    to ``cancelled`` and release the active slot from its finally block.
-    A job whose on-disk status is already terminal has no live runner to
-    observe the flag, so we skip the no-op call.
-    """
-    job = job_store.get(job_id)
-    if job is None or job.status not in _TERMINAL_JOB_STATUSES:
-        job_store.request_cancel(job_id)
-
-
-def _wait_for_active_slot_release(job_store: JobStore) -> bool:
-    """Wait up to ``_RESET_WAIT_TIMEOUT`` for the active slot to drain.
-
-    Returns ``True`` once the slot is free. Handles the degraded path where
-    the holder became terminal on disk without ``release_active`` being
-    called (crashed runner finally block) by reclaiming the slot via the
-    atomic compare-and-release ``force_release_active_if`` — so a racy
-    ``create_and_claim_active`` from a parallel request between the
-    observation and the release cannot clear the new owner's slot.
-    """
-    deadline = time.monotonic() + _RESET_WAIT_TIMEOUT
-    while time.monotonic() < deadline:
-        if not job_store.has_active_job():
-            return True
-        current = job_store.active_job_id
-        if current is not None:
-            current_job = job_store.get(current)
-            if (
-                current_job is not None
-                and current_job.status in _TERMINAL_JOB_STATUSES
-                and job_store.force_release_active_if(current)
-            ):
-                return True
-        time.sleep(_RESET_WAIT_INTERVAL)
-    return False
-
-
-def _force_release_orphan_slot(job_store: JobStore) -> None:
-    """Force-release a slot that no runner drained within the wait budget.
-
-    Returning 200 with the slot still held would reintroduce the exact
-    ``JOB_CONFLICT`` regression H-0063 / Issue #99 set out to remove (the
-    user clicked reset expressly to clear state). The wait budget is set
-    longer than ``subprocess_runner._WAIT_TIMEOUT`` so a legitimate
-    subprocess runner has time to finish its ``proc.terminate`` /
-    ``proc.wait`` cycle first; if we still time out the slot is almost
-    certainly orphaned (a previous process / test / client died without
-    draining it). ``force_release_active_if`` only clears the exact id we
-    observed, never a new claim that landed in between.
-    """
-    stuck_id = job_store.active_job_id
-    if stuck_id is not None and job_store.force_release_active_if(stuck_id):
-        _log.warning(
-            "workspace_reset: active slot %s did not release within %.2fs; "
-            "force-released so the next fit / tune does not JOB_CONFLICT",
-            stuck_id,
-            _RESET_WAIT_TIMEOUT,
-        )
-
-
-def _teardown_active_job(job_store: JobStore) -> None:
-    """Cancel and drain any background fit / tune so reset yields a clean slate.
-
-    H-0063 / Issue #99: if a fit / tune is still running, reset must cancel
-    it and release the JobStore active slot, otherwise the next Fit / Tune
-    click gets ``JOB_CONFLICT`` 409. We request cancel, wait briefly for the
-    runner to drain the slot from its own finally block, and — only if it
-    never does — force-release. Callers must invoke this *before* clearing
-    workspace state so a shutting-down runner thread still sees live
-    ``ws.dataframe`` / ``ws.model`` references during its finally path.
-    """
-    active_id = job_store.active_job_id
-    if active_id is None:
-        return
-    _request_cancel_if_running(job_store, active_id)
-    if not _wait_for_active_slot_release(job_store):
-        _force_release_orphan_slot(job_store)
-
 
 @router.post("/reset")
 def workspace_reset(
     ws: WorkspaceState = Depends(get_workspace),
     job_store: JobStore = Depends(get_job_store),
+    broadcaster: ProgressBroadcaster = Depends(get_broadcaster),
 ) -> dict[str, str]:
     """Reset all workspace state.
 
-    Cancels and drains any background fit / tune first (see
-    :func:`_teardown_active_job` for the cancel + slot-release choreography
-    and its degraded paths), then clears workspace state. The order matters:
-    workspace state is cleared *after* the slot wait so the shutting-down
-    runner thread still sees live ``ws.dataframe`` / ``ws.model`` references.
+    Cancels and drains any background fit / tune first, then clears
+    workspace state. The order is fixed (P-0119): (1) in one lifecycle
+    lock section, advance the lifecycle reset generation (an older
+    request can no longer be admitted) and cancel the active job; (2)
+    wait for its slot, and force-release it if it does not drain, which
+    ends the job ``cancelled``; (3) clear the workspace. The workspace is
+    cleared *after* the slot wait so the shutting-down runner still sees
+    live ``ws.dataframe`` / ``ws.model`` references.
     """
-    _teardown_active_job(job_store)
+    teardown_active_job(
+        job_store,
+        broadcaster,
+        timeout=_RESET_WAIT_TIMEOUT,
+        interval=_RESET_WAIT_INTERVAL,
+    )
     ws.reset()
     return {"status": "ok"}
 
@@ -660,6 +583,12 @@ def workspace_fit(
     ``| None``) because ``from __future__ import annotations`` together
     with ``Optional`` + ``Depends`` breaks FastAPI's body detection,
     causing the parameter to be parsed as a query string.
+
+    P-0119: the job is created holding the slot, and admitted
+    (``running``) by the launcher before it waits for the previous
+    worker. A reset or a cancel between the two, or a failed wait,
+    answers 409 ``JOB_CONFLICT``; the job is then ``cancelled`` or
+    ``failed``.
     """
     # P-0086: apply body.config first so validate runs against what the
     # caller actually wants to fit, and so ws.config ends up matching
@@ -692,41 +621,32 @@ def workspace_fit(
     # metadata in a single critical section so two concurrent
     # /fit requests cannot race past the has_active_job check and
     # leave an orphan "failed" job on disk.
-    job = job_store.create_and_claim_active(
+    # P-0119: the reservation and the request's lifecycle reset generation
+    # are taken in one lock section; the launcher admits with them.
+    reservation = job_store.create_and_reserve(
         backend_name=get_backend_name(ws),
         config=ws.config,
         data_ref=ws.data_ref,
         job_type="fit",
     )
-    if job is None:
+    if reservation is None:
         raise JobConflictError(job_store.active_job_id or "unknown")
-    try:
-        job_id = start_fit_async(
+    job, reset_gen = reservation
+    dataframe = ws.dataframe
+    job_id = launch_reserved(
+        job_store,
+        broadcaster,
+        job,
+        lambda: start_fit_async(
             ws=ws,
             job_store=job_store,
             broadcaster=broadcaster,
             config=ws.config,
-            dataframe=ws.dataframe,
+            dataframe=dataframe,
             job=job,
-        )
-    except PreviousJobStillRunningError:
-        job.status = "failed"
-        job.error = "Previous job still running"
-        job_store.update(job)
-        job_store.release_active(job.job_id)
-        # Issue #154: record the terminal status so the
-        # lizystudio_jobs_total{status="failed"} counter is not under-
-        # counted on slot-claim-after-claim failures.
-        job_store.record_job_terminal(job.job_type, "failed")
-        raise JobConflictError(job.job_id) from None
-    except Exception:
-        # Any other failure after we claimed the slot must release it,
-        # otherwise the slot stays held until server restart. Emit the
-        # failed metric (#154) before re-raising so the counter
-        # reflects the true failure count.
-        job_store.release_active(job.job_id)
-        job_store.record_job_terminal(job.job_type, "failed")
-        raise
+            reset_gen=reset_gen,
+        ),
+    )
     return {"job_id": job_id}
 
 
@@ -742,6 +662,9 @@ def workspace_tune(
     P-0086 (Issue #251): ``body.config`` may be provided to atomically
     overwrite ``ws.config`` at tune time. See ``workspace_fit`` above
     for the rationale behind the ``WorkspaceTuneRequest()`` default.
+
+    P-0119: admission and the 409 ``JOB_CONFLICT`` answers are the same
+    as for ``POST /fit``.
     """
     # P-0086: same semantics as workspace_fit — body.config wins and
     # updates ws.config before tuning injection / validation runs.
@@ -781,33 +704,30 @@ def workspace_tune(
     if space_errors:
         raise ValidationError(space_errors)
     # CRITICAL-2: atomic create + slot claim, see workspace_fit above.
-    job = job_store.create_and_claim_active(
+    # P-0119: the reservation and the request's lifecycle reset generation
+    # are taken in one lock section; the launcher admits with them.
+    reservation = job_store.create_and_reserve(
         backend_name=get_backend_name(ws),
         config=job_config,
         data_ref=ws.data_ref,
         job_type="tune",
     )
-    if job is None:
+    if reservation is None:
         raise JobConflictError(job_store.active_job_id or "unknown")
-    try:
-        job_id = start_tune_async(
+    job, reset_gen = reservation
+    dataframe = ws.dataframe
+    job_id = launch_reserved(
+        job_store,
+        broadcaster,
+        job,
+        lambda: start_tune_async(
             ws=ws,
             job_store=job_store,
             broadcaster=broadcaster,
             config=job_config,
-            dataframe=ws.dataframe,
+            dataframe=dataframe,
             job=job,
-        )
-    except PreviousJobStillRunningError:
-        job.status = "failed"
-        job.error = "Previous job still running"
-        job_store.update(job)
-        job_store.release_active(job.job_id)
-        # Issue #154: record the terminal status (same fix as /fit).
-        job_store.record_job_terminal(job.job_type, "failed")
-        raise JobConflictError(job.job_id) from None
-    except Exception:
-        job_store.release_active(job.job_id)
-        job_store.record_job_terminal(job.job_type, "failed")
-        raise
+            reset_gen=reset_gen,
+        ),
+    )
     return {"job_id": job_id}

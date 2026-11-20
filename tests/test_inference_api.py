@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services.inference import InferenceRecord, InferenceStore
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.integration
 
@@ -53,7 +54,7 @@ def _create_inference_setup(
         params=[],
     )
     job.model_path = "/fake/model/path"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     # Create a mock inference record directly via InferenceStore
     inf_store = InferenceStore(job_store.jobs_dir)
@@ -652,7 +653,7 @@ def _create_job_with_status(
         job_type="fit",
     )
     job.status = status
-    job_store.update(job)
+    seed_job(job_store, job)
     return job.job_id
 
 

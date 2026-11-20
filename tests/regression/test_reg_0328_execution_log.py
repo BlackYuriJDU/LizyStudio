@@ -44,6 +44,7 @@ import pytest
 
 from lizystudio.services import subprocess_runner
 from lizystudio.services._training_core import _run_job_core
+from tests.lifecycle_seed import admitted_sink
 
 pytestmark = pytest.mark.unit
 
@@ -183,6 +184,7 @@ class TestRunJobCoreAppendsLogs:
             job_store=store,
             broadcaster=None,
             execute_fn=execute_fn,
+            sink=admitted_sink(store, job, None),
         )
 
         # Both the parent's pre-existing capture AND the child's logger

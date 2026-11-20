@@ -21,16 +21,27 @@ from __future__ import annotations
 import copy
 import io
 import logging
+import threading
 import time
-import traceback
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lizystudio.backends.base import BackendAdapter, ProgressCallback
-from lizystudio.backends.types import FitSummary, TuningSummary
+from lizystudio.services import _child_barrier
+from lizystudio.services._job_lifecycle_types import (
+    AdmissionRefused,
+    Outcome,
+    RunToken,
+)
+from lizystudio.services._job_outcome import (
+    ExecuteFn,
+    execute_outcome,
+    refusal_error_text,
+)
+from lizystudio.services._job_sinks import OutcomeSink, emit_effects, sync_job
 from lizystudio.services._job_warnings import JobWarningCollector, capture_job_warnings
 from lizystudio.services.jobs import Job, JobStore
 
@@ -67,17 +78,18 @@ def _make_cancel_aware_cb(
     job_id: str,
     job_store: JobStore,
     broadcaster: ProgressBroadcaster | None,
+    token: RunToken | None = None,
 ) -> ProgressCallback:
-    """Create a progress callback that checks for cancellation (H-0011)
-    and pause (P-0099 v3-20c, R-1.4).
+    """Create a progress callback that checks for cancellation (H-0011),
+    a revoked run token (P-0119 INV-LC-5) and pause (P-0099 v3-20c, R-1.4).
 
-    Both observations short-circuit the broadcaster emit so a pending
+    Every observation short-circuits the broadcaster emit so a pending
     Pause click does not leak a "trial 7/100" frame after the user
-    has already requested the unwind. Cancel is checked first because
-    the user's intent on a co-pending cancel+pause click is "stop now",
-    not "stop here so I can resume" — a paused job that the user has
-    also cancelled wastes the slot until the next /unpause+/cancel
-    round-trip, while the cancelled branch terminates at once.
+    has already requested the unwind. Cancel and a revoked token are checked
+    before pause because the user's intent on a co-pending cancel+pause
+    click is "stop now", not "stop here so I can resume". A revoked token
+    (the run was force-released) stops the worker at its next cooperative
+    point; its later commit is dropped by the primitive.
     """
 
     def callback(
@@ -89,9 +101,14 @@ def _make_cancel_aware_cb(
     ) -> None:
         if job_store.is_cancel_requested(job_id):
             raise CancelledError
+        if token is not None and not job_store.is_live(token):
+            raise CancelledError
         if job_store.is_pause_requested(job_id):
             raise PausedError
-        if broadcaster is not None:
+        if broadcaster is None:
+            return
+
+        def send() -> None:
             broadcaster.send_progress(
                 job_id,
                 current=current,
@@ -100,6 +117,15 @@ def _make_cancel_aware_cb(
                 fold_results=extra.get("fold_results"),
                 trial_results=extra.get("trial_results"),
             )
+
+        if token is None:
+            # The subprocess child: its frames go to the JSONL relay, which
+            # the parent fences by the run token before forwarding them.
+            send()
+        elif not job_store.emit_if_live(token, send):
+            # Revoked after the checks above (Codex r1-4): no frame, and the
+            # worker stops at this cooperative point.
+            raise CancelledError
 
     return callback
 
@@ -125,49 +151,6 @@ def _subprocess_duration_seconds(job: Job) -> float:
     return max(0.0, (completed - created).total_seconds())
 
 
-def _emit_terminal_metric(job_store: JobStore, job: Job, duration: float = 0.0) -> None:
-    """Bump ``lizystudio_jobs_total`` and observe duration (H-0065, H-0066).
-
-    A-9: delegates to the bound :class:`~lizystudio.metrics.MetricsRegistry`
-    via ``job_store.record_job_terminal``. Centralises the per-literal
-    dispatch that mypy requires for Literal narrowing.
-    """
-    if job.status == "completed":
-        job_store.record_job_terminal(job.job_type, "completed", duration=duration)
-    elif job.status == "failed":
-        job_store.record_job_terminal(job.job_type, "failed", duration=duration)
-    elif job.status == "cancelled":
-        job_store.record_job_terminal(job.job_type, "cancelled", duration=duration)
-
-
-def _claim_active_or_fail(
-    job: Job,
-    job_store: JobStore,
-    broadcaster: ProgressBroadcaster | None,
-) -> bool:
-    """Claim the single active slot for *job*. Return ``True`` on success.
-
-    On contention the job is transitioned to ``failed`` (with a
-    ``JOB_CONFLICT`` broadcast and a terminal-metric bump) and ``False`` is
-    returned — the caller short-circuits and returns the failed job.
-    """
-    if job_store.claim_active(job.job_id):
-        return True
-    job.status = "failed"
-    job.error = "Another job is already running"
-    job.completed_at = datetime.now(timezone.utc).isoformat()
-    job_store.update(job)
-    if broadcaster is not None:
-        broadcaster.send_error(
-            job.job_id, "Another job is already running", code="JOB_CONFLICT"
-        )
-    job_store.record_job_terminal(job.job_type, "failed")
-    return False
-
-
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-
-
 def _fail_escaped_job(
     *,
     ws: WorkspaceState,
@@ -176,23 +159,21 @@ def _fail_escaped_job(
     broadcaster: ProgressBroadcaster | None,
     exc: BaseException,
     epoch: int,
+    token: RunToken,
 ) -> None:
     """Settle *job* after an exception escaped its fit/tune worker thread.
 
-    Issue #612 (INV-1): the launchers' thread bodies had no guard, so an
-    exception outside ``_apply_job_outcome`` left the job ``pending`` (or
-    ``paused`` on the unpause path) and the active slot held forever. A job
-    that is not terminal yet is stamped ``failed``, broadcast and counted;
-    a terminal status written before the exception (by ``_run_job_core``,
-    a cancel, or the subprocess child) is kept. The slot and the job's
-    cancel and pause flags are released either way, in a ``finally`` so a
-    failure of this handler cannot skip them.
+    Issue #612 (INV-1): an exception outside the core must not leave the job
+    non-terminal and the slot held. P-0119: the settle is a ``failed``
+    commit of the run's *token* — conditioned on it, so an old run's late
+    crash cannot touch a newer run of the same job id (#765 の片割れ). A
+    commit dropped because the token is no longer live does nothing; a
+    commit whose own write keeps failing abandons the run (slot and flags
+    released, token-conditioned) so the slot is not held forever.
 
-    In thread mode *job* is the instance ``_run_job_core`` mutated. When it
-    is terminal in memory but not on disk, the core's ``finally`` already
-    counted the terminal metric and only the persistence (and so the
-    broadcast, which follows a successful write) failed: the handler then
-    persists and broadcasts without counting again.
+    The effects (one frame, one metric) come from the commit that published
+    the status, so a terminal write that failed once and succeeded here is
+    still counted and broadcast once.
     """
     message = f"{type(exc).__name__}: {exc}"
     _logger.error(
@@ -201,27 +182,20 @@ def _fail_escaped_job(
         job.job_type,
         exc_info=exc,
     )
+    error = f"worker crashed: {message}"
     try:
-        current = job_store.get(job.job_id)
-        if current is not None and current.status not in _TERMINAL_STATUSES:
-            already_counted = job.status in _TERMINAL_STATUSES
-            current.status = "failed"
-            current.error = f"worker crashed: {message}"
-            current.completed_at = datetime.now(timezone.utc).isoformat()
-            job_store.update(current)
-            ws.note_current_job(current.job_id, epoch=epoch)
-            if broadcaster is not None:
-                broadcaster.send_error(current.job_id, current.error)
-            if not already_counted:
-                job_store.record_job_terminal(current.job_type, "failed")
-    except Exception:  # noqa: BLE001 — log it; the cleanup below must run
+        effects = job_store.commit(
+            token, Outcome(status="failed", error=error, message=error)
+        )
+    except Exception:  # noqa: BLE001 — log it; the token-conditioned cleanup runs
         _logger.exception(
             "event='training.worker_crash_settle_failed' job=%s", job.job_id
         )
-    finally:
-        job_store.release_active(job.job_id)
-        job_store.clear_cancel(job.job_id)
-        job_store.clear_pause(job.job_id)
+        job_store.abandon(token)
+        return
+    if effects is not None:
+        ws.note_current_job(job.job_id, epoch=epoch)
+        emit_effects(job_store, broadcaster, effects)
 
 
 @contextmanager
@@ -242,115 +216,6 @@ def _capture_job_logs(job_id: str) -> Iterator[io.StringIO]:
     finally:
         job_logger.removeHandler(handler)
         handler.close()
-
-
-def _apply_job_outcome(
-    job: Job,
-    job_store: JobStore,
-    broadcaster: ProgressBroadcaster | None,
-    *,
-    execute_fn: Callable[
-        [ProgressCallback], tuple[FitSummary, TuningSummary | None, str]
-    ],
-    cb: ProgressCallback,
-) -> None:
-    """Run *execute_fn* and stamp the resulting terminal (or ``paused``) state.
-
-    Stamps ``running`` (so the Jobs list reflects it before *execute_fn*
-    starts), then maps the worker's exit to a job status — ``completed`` on
-    success; ``paused`` on :class:`PausedError` (a NON-terminal unwind: the
-    caller's finally keeps slot ownership and the cancel flag, and the no-op
-    ``_emit_terminal_metric`` skips it); ``cancelled`` on
-    :class:`CancelledError` / ``KeyboardInterrupt``; ``failed`` on any other
-    exception — and updates the store + notifies subscribers for each.
-    """
-    job.status = "running"
-    job_store.update(job)
-    try:
-        fit_result, tune_result, model_dir = execute_fn(cb)
-        job.status = "completed"
-        job.fit_result = fit_result
-        job.tune_result = tune_result
-        job.model_path = model_dir
-        job.completed_at = datetime.now(timezone.utc).isoformat()
-        job_store.update(job)
-        if broadcaster is not None:
-            broadcaster.send_completed(job.job_id)
-    except PausedError:
-        # P-0099 v3-20c (R-1.4): paused is a NON-terminal unwind. The
-        # caller's finally preserves slot ownership AND the cancel flag so a
-        # co-pending cancel survives into the resume worker.
-        job.status = "paused"
-        job.completed_at = None
-        job_store.update(job)
-        # P-0099 v3-20e: notify subscribers via WsPaused so the frontend
-        # Jobs UI flips state without waiting for the next jobs-list refresh.
-        # NOT cached for late-subscriber replay — pause is resumable, so a
-        # stale paused frame from a previous session would mislead a
-        # subscriber that connects after the user clicked Resume.
-        if broadcaster is not None:
-            broadcaster.send_paused(job.job_id)
-    except (CancelledError, KeyboardInterrupt):
-        job.status = "cancelled"
-        job.completed_at = datetime.now(timezone.utc).isoformat()
-        job_store.update(job)
-        if broadcaster is not None:
-            broadcaster.send_error(job.job_id, "Job cancelled", code="JOB_CANCELLED")
-    except BackendRefusalError as exc:
-        _fail_with_refusal(job, job_store, broadcaster, exc)
-    except Exception as exc:
-        job.status = "failed"
-        job.error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-        job.completed_at = datetime.now(timezone.utc).isoformat()
-        job_store.update(job)
-        if broadcaster is not None:
-            # P-0116 D5 (#691): a tune whose trials all failed keeps its
-            # own code, so the UI does not show it as a generic error; so
-            # does a search space lizyml refused (P-0116 D1).
-            message = f"{type(exc).__name__}: {exc}"
-            if isinstance(exc, TuningFailedError):
-                broadcaster.send_error(job.job_id, message, code="TUNING_FAILED")
-            elif isinstance(exc, SearchSpaceRefusedError):
-                broadcaster.send_error(job.job_id, message, code="SEARCH_SPACE_REFUSED")
-            else:
-                broadcaster.send_error(job.job_id, message)
-
-
-def refusal_error_text(exc: BackendRefusalError) -> str:
-    """The job error of a classified backend refusal (P-0117 D2).
-
-    Its Studio code, the backend's code and reason, the message and the
-    remedy, on one line and without a traceback.
-    """
-    return (
-        f"{exc.code} ({exc.backend_code}: {exc.reason}): {exc.message} "
-        f"Remedy: {exc.remedy}."
-    )
-
-
-def _fail_with_refusal(
-    job: Job,
-    job_store: JobStore,
-    broadcaster: ProgressBroadcaster | None,
-    exc: BackendRefusalError,
-) -> None:
-    """Fail *job* with a classified backend refusal (P-0117 D2).
-
-    ``job.error`` and the WebSocket error carry the coded reason and the
-    remedy; the traceback goes to the job's logger, which
-    :func:`_capture_job_logs` persists into ``execution.log`` in both
-    worker modes.
-    """
-    text = refusal_error_text(exc)
-    logging.getLogger(f"lizystudio.training.{job.job_id}").error(
-        "Job failed: %s", text, exc_info=exc
-    )
-    job.status = "failed"
-    job.error = text
-    job.completed_at = datetime.now(timezone.utc).isoformat()
-    job_store.update(job)
-    if broadcaster is not None:
-        broadcaster.send_error(job.job_id, text, code=exc.code)
 
 
 def _persist_job_log(job_store: JobStore, job_id: str, captured: str) -> None:
@@ -387,24 +252,21 @@ def _run_job_core(
     job: Job,
     job_store: JobStore,
     broadcaster: ProgressBroadcaster | None,
-    execute_fn: Callable[
-        [ProgressCallback],
-        tuple[FitSummary, TuningSummary | None, str],
-    ],
+    execute_fn: ExecuteFn,
+    sink: OutcomeSink,
 ) -> Job:
-    """Shared execution wrapper for fit / tune / retune jobs.
+    """Shared execution wrapper for fit / tune / retune jobs (P-0119).
 
-    Claims the active slot, runs *execute_fn* under captured logging, stamps
-    the resulting status, and releases the slot — except for ``paused``,
-    which is a non-terminal unwind that keeps the slot AND the cancel flag so
-    a resume worker can short-circuit if the user cancelled while paused
-    (P-0099 v3-20c).
+    The core neither claims the slot nor writes ``running``: admission did
+    both before the worker started. It runs *execute_fn* under captured
+    logging and warnings, then hands the outcome to *sink* — the parent's
+    primitive in thread mode (:class:`ParentCommitSink`), the outcome file
+    in the subprocess child (:class:`ChildOutcomeSink`, P-0119 PR-B). The
+    slot, the flags and the terminal metric are settled by that commit, not
+    here. *job*'s lifecycle fields mirror the committed row on return.
     """
-    if not _claim_active_or_fail(job, job_store, broadcaster):
-        return job
-
     start_time = time.monotonic()  # H-0066: wall-clock for the duration histogram
-    cb = _make_cancel_aware_cb(job.job_id, job_store, broadcaster)
+    cb = _make_cancel_aware_cb(job.job_id, job_store, broadcaster, token=sink.token)
 
     with _capture_job_logs(job.job_id) as log_buffer:
         # P-0117 D4: the backend's warnings raised on this thread go to the
@@ -415,24 +277,17 @@ def _run_job_core(
             job_store=job_store,
             broadcaster=broadcaster,
             job_logger=logging.getLogger(f"lizystudio.training.{job.job_id}"),
+            token=sink.token,
+            persist=sink.persists_warnings,
         )
         try:
+            # P-0119: test-only child barrier, outside the outcome mapping, so a
+            # KeyboardInterrupt here escapes the core with no outcome written.
+            _child_barrier.barrier("core_entry")
             with capture_job_warnings(collector):
-                _apply_job_outcome(
-                    job, job_store, broadcaster, execute_fn=execute_fn, cb=cb
-                )
+                outcome = execute_outcome(job, execute_fn, cb, sink)
+            sink.commit(job, outcome, duration=time.monotonic() - start_time)
         finally:
-            # P-0099 v3-20c: paused is non-terminal — KEEP slot ownership and
-            # KEEP the cancel flag so the resume worker can short-circuit if
-            # the user cancelled while paused. Every other branch (completed /
-            # cancelled / failed) is terminal and must release.
-            if job.status != "paused":
-                job_store.release_active(job.job_id)
-                job_store.clear_cancel(job.job_id)
-            # H-0065 / H-0066: no-op when paused (not a terminal transition).
-            _emit_terminal_metric(
-                job_store, job, duration=time.monotonic() - start_time
-            )
             _persist_job_log(job_store, job.job_id, log_buffer.getvalue())
 
     return job
@@ -534,18 +389,75 @@ def _join_previous_thread(ws: WorkspaceState) -> None:
             )
 
 
+def record_outcome(ws: WorkspaceState, finished: Job, *, epoch: int) -> None:
+    """Write the post-job workspace state for *finished* (P-0114 fenced).
+
+    Only a ``completed`` commit surfaces its results (P-0119 Q2: when a
+    cancel won over a completed run, its sidecars stay on disk but the
+    workspace does not record them); any other final status records the job
+    with no results, as before.
+    """
+    completed = finished.status == "completed"
+    ws.record_completion(
+        fit_result=finished.fit_result if completed else None,
+        tune_result=finished.tune_result if completed else None,
+        job_id=finished.job_id,
+        epoch=epoch,
+    )
+
+
+def start_worker(
+    *,
+    ws: WorkspaceState,
+    job_store: JobStore,
+    broadcaster: ProgressBroadcaster | None,
+    token: RunToken,
+    run: Callable[[], None],
+    epoch: int,
+    join: Callable[[WorkspaceState], None],
+    precheck: Callable[[], str | None] | None = None,
+) -> bool:
+    """Join the previous worker, pass the start gate, start *run* (P-0119).
+
+    No lock is held across the join or the thread start. *precheck* runs
+    after the join (the retune launcher's workspace checks); an error it
+    returns aborts the admission and starts nothing (returns False). A
+    revoked token at the gate starts nothing (the operation that revoked it
+    wrote the terminal) and raises :class:`AdmissionRefused`. A failed join
+    or thread start aborts the admission — back to ``paused`` for an
+    unpause, ``cancelled`` with CANCEL, ``failed`` otherwise — and re-raises.
+    """
+    try:
+        join(ws)
+        error = precheck() if precheck is not None else None
+        if error is not None:
+            emit_effects(job_store, broadcaster, job_store.abort(token, error))
+            return False
+        if not job_store.start(token):
+            raise AdmissionRefused(token.job_id, "revoked", None)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+    except Exception as exc:
+        effects = job_store.abort(token, f"{type(exc).__name__}: {exc}")
+        emit_effects(job_store, broadcaster, effects)
+        raise
+    ws.register_job_thread(thread, epoch=epoch, job_id=token.job_id)
+    return True
+
+
 def _run_subprocess_job(
     ws: WorkspaceState,
     job: Job,
     job_store: JobStore,
     broadcaster: ProgressBroadcaster | None,
     *,
+    token: RunToken,
     mode: str | None = None,
     parent_job_id: str | None = None,
     retune_n_trials: int | None = None,
     retune_expand_boundary: bool | None = None,
     retune_boundary_threshold: float | None = None,
-    on_data_missing: Callable[[Job], None] | None = None,
+    missing_data_error: str = "No data loaded — cannot run subprocess job",
     resume_from_existing_study: bool = False,
     epoch: int,
 ) -> Job:
@@ -553,74 +465,40 @@ def _run_subprocess_job(
 
     Shared by fit, tune, and retune subprocess paths. *epoch* is the
     workspace reset generation the launcher captured (P-0114); workspace
-    writes from an older generation are dropped.
+    writes from an older generation are dropped. P-0119: a missing dataset
+    aborts the admission; otherwise the parent's reconcile commits the
+    child's result through *token* (no ``finally`` metric any more — the
+    commit's effects carry the one metric).
     """
     from lizystudio.services.subprocess_runner import run_job_in_subprocess
     from lizystudio.services.workspace import get_backend_name
 
-    terminal_already_recorded = False
-    try:
-        if ws.data_ref is None or not ws.data_ref.path:
-            if on_data_missing is not None:
-                on_data_missing(job)
-                terminal_already_recorded = True
-            else:
-                job.status = "failed"
-                job.error = "No data loaded — cannot run subprocess job"
-                job.completed_at = datetime.now(timezone.utc).isoformat()
-                job_store.update(job)
-                if broadcaster is not None:
-                    broadcaster.send_error(job.job_id, job.error)
-                ws.note_current_job(job.job_id, epoch=epoch)
-                job_store.record_job_terminal(job.job_type, "failed")
-                terminal_already_recorded = True
-            return job
-        data_path = ws.data_ref.path
-        extra_kwargs: dict[str, Any] = {}
-        if mode is not None:
-            extra_kwargs["mode"] = mode
-        if parent_job_id is not None:
-            extra_kwargs["parent_job_id"] = parent_job_id
-        if retune_n_trials is not None:
-            extra_kwargs["retune_n_trials"] = retune_n_trials
-        if retune_expand_boundary is not None:
-            extra_kwargs["retune_expand_boundary"] = retune_expand_boundary
-        if retune_boundary_threshold is not None:
-            extra_kwargs["retune_boundary_threshold"] = retune_boundary_threshold
-        if resume_from_existing_study:
-            extra_kwargs["resume_from_existing_study"] = True
-        finished = run_job_in_subprocess(
-            job=job,
-            job_store=job_store,
-            broadcaster=broadcaster,
-            backend_name=get_backend_name(ws),
-            data_path=data_path,
-            **extra_kwargs,
-        )
-        ws.record_completion(
-            fit_result=finished.fit_result,
-            tune_result=finished.tune_result,
-            job_id=finished.job_id,
-            epoch=epoch,
-        )
-        return finished
-    finally:
-        # H-0065 / H-0066: subprocess child writes the terminal status
-        # on disk; re-read it here so the parent emits exactly one
-        # counter increment per job in either mode.
-        #
-        # P-0099 v3-20d: ``paused`` is non-terminal — the parent must
-        # KEEP slot ownership so the user's /unpause click can resume
-        # in place. v3-20c handled this on the in-process branch
-        # (``_run_job_core.finally``); the subprocess wrapper missed
-        # the same skip and would otherwise drop ``active_job_id`` to
-        # ``None`` after the child exited via PausedError.
-        latest = job_store.get(job.job_id) if not terminal_already_recorded else None
-        if latest is None or latest.status != "paused":
-            job_store.release_active(job.job_id)
-            if latest is not None:
-                duration = _subprocess_duration_seconds(latest)
-                _emit_terminal_metric(job_store, latest, duration=duration)
+    if ws.data_ref is None or not ws.data_ref.path:
+        emit_effects(job_store, broadcaster, job_store.abort(token, missing_data_error))
+        ws.note_current_job(job.job_id, epoch=epoch)
+        sync_job(job, job_store)
+        return job
+    extra_kwargs: dict[str, Any] = {
+        "mode": mode,
+        "parent_job_id": parent_job_id,
+        "retune_n_trials": retune_n_trials,
+        "retune_expand_boundary": retune_expand_boundary,
+        "retune_boundary_threshold": retune_boundary_threshold,
+    }
+    extra_kwargs = {k: v for k, v in extra_kwargs.items() if v is not None}
+    if resume_from_existing_study:
+        extra_kwargs["resume_from_existing_study"] = True
+    finished = run_job_in_subprocess(
+        job=job,
+        job_store=job_store,
+        broadcaster=broadcaster,
+        backend_name=get_backend_name(ws),
+        data_path=ws.data_ref.path,
+        token=token,
+        **extra_kwargs,
+    )
+    record_outcome(ws, finished, epoch=epoch)
+    return finished
 
 
 __all__ = [
@@ -628,7 +506,6 @@ __all__ = [
     "PausedError",
     "PreviousJobStillRunningError",
     "_JOIN_TIMEOUT",
-    "_emit_terminal_metric",
     "_join_previous_thread",
     "_make_cancel_aware_cb",
     "_prepare_autofit_config",
@@ -637,4 +514,7 @@ __all__ = [
     "_run_subprocess_job",
     "_save_tuning_plot",
     "_subprocess_duration_seconds",
+    "record_outcome",
+    "refusal_error_text",
+    "start_worker",
 ]

@@ -16,6 +16,7 @@ import pytest
 from lizystudio.backends.types import DataRef
 from lizystudio.services import _job_metadata
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -39,7 +40,7 @@ def _make_job(store: JobStore, status: str = "completed") -> str:
         job_type="fit",
     )
     job.status = status  # type: ignore[assignment]
-    store.update(job)
+    seed_job(store, job)
     return job.job_id
 
 

@@ -334,7 +334,10 @@ class BackendAdapter(
 - ブラウザ再アクセス時は `workspace_result = None`（右パネル空）
 - 過去のJob結果は表示しない（混乱防止）
 - **Active job lock (P-0089)**: `active_job_id` がセットされている間、`PUT /api/workspace/config` および `PATCH /api/workspace/config` は 409 `WORKSPACE_LOCKED` を返す。これは UI 上の cross-hook race（CV strategy 切り替え / target 変更等）が走行中ジョブの config を後から書き換えるのを構造的に防ぐ。INV: `meta.json` に保存される config は `claim_active` 直前の workspace config と完全一致する
-- **Startup reconciliation (P-0099 v3-22a / R-1.5b)**: `active_job_id` はインメモリだが、サーバ再起動時に `JobStore.reconcile_at_startup()` が on-disk `meta.json` をスキャンして再構築する。`running` / `pending` の orphan は `failed` 化（worker thread / subprocess は前プロセスと共に消えているため）、`paused` job は `active_job_id` に再 attach（INV-7: WS 切断は active slot を release しない / restart 越しに paused slot を保持）、terminal states は rewrite しない、idempotent。
+- **Startup reconciliation (P-0099 v3-22a / R-1.5b、P-0119 Q6)**: `active_job_id` はインメモリだが、サーバ再起動時に `JobStore.recover()`（旧名 `reconcile_at_startup()` は 1 リリースの間 alias）が on-disk `meta.json` をスキャンして再構築する。下の INV-restart-1〜3 を満たす。`recover` は lifespan の起動時、API と launcher が動き出す前にだけ通り、直後の `mark_started()` 以降の呼び出しは `RecoverRefusedError` で拒否される。起動時に `event='server.worker_mode'` の INFO で worker の mode（thread / subprocess）を 1 行出す。
+  - **INV-restart-1**: CANCEL file のある `running` / `pending` / `paused` の行は `cancelled` にする（再起動の前に 200 で受け付けた cancel は失われない、INV-LC-4）。CANCEL の無い `running` / `pending` の行は `failed` にする（worker thread / subprocess は前プロセスと共に消えている）。違反: cancel を受け付けた job が再起動で `failed` になる。
+  - **INV-restart-2**: CANCEL の無い `paused` の生き残りは高々 1 つ（`created_at` の新しいもの）で、token の無い slot の保持として `active_job_id` に戻る（INV-7）。ほかの `paused` は `failed`。
+  - **INV-restart-3**: terminal の行は書き換えない。`recover` は idempotent。
 - **Reload restoration (P-0102 / v3-24 / R-2.2)**: `current_job_id` を `GET /api/workspace/status` で露出している。frontend は `?job_id=` 不在時にこれを fallback として 1 回だけ hydrate し（latch は `workspace_reset` までクリアされない）、長時間学習中のリロードで進捗を見失わないようにする。dirty な config form を持つ状態の `beforeunload` は browser default confirm dialog を出す（誤リロード防止）。`current_job_id` が null なら従来どおり空状態。1 名利用前提のため multi-tab 衝突制御は scope 外。
 
 #### 3.4.2 Job 状態（永続・ディスク）
@@ -356,28 +359,45 @@ class BackendAdapter(
 | `model_path` | `Path \| None` | 学習済みモデルの保存パス |
 | `error` | `str \| None` | エラーメッセージ（失敗時） |
 
-**状態遷移と不変条件（P-0099 R-1）:** Job state machine の合法遷移は以下のみ。illegal transitions は `JobStore.set_status` が `AssertionError` で reject する（runtime guard）。invariant test は `tests/regression/test_inv_*.py`。
+**状態遷移と不変条件（P-0099 R-1、P-0119）:** Job state machine の合法遷移は以下のみ。status を書くのは P-0119 の遷移 primitive（`services/_job_lifecycle.py` の `JobLifecycle`）の 3 つの形だけである: token なしの **settle**（`pending` / `paused` のみ）、live な run token の **commit**（`commit` / `abort` / `force_release`）、起動時の **recover**。どれも唯一の書き込み点 `JobLifecycle._write_status_locked` を通り、illegal transitions は `IllegalTransitionError`（`AssertionError` の派生）で reject する（runtime guard、`services/_job_lifecycle_types.py:LEGAL_TRANSITIONS`）。`JobStore.update()` は status・`completed_at`・`error` を書かない（結果・warning・model path のみ）。subprocess の子は `meta.json` を一切書かない（status も結果も warning も）。子は run の終わりに `outcome.json` だけを書き、親の reconcile がそれを commit したときに初めて status が見える（下の §3.4.4）。invariant test は `tests/regression/test_inv_*.py` と `test_reg_0613_*.py` / `test_reg_0697_*.py`。
 
 ```
-[*] → pending          (POST /fit / /tune)
-pending → running      (worker thread が claim_active)
-pending → cancelled    (start 前の DELETE / cancel)
-running → completed    (terminal write OK)
-running → failed       (exception / subprocess died)
-running → cancelled    (cancel signal を mid-run で観測)
-running → paused       (Tune trial 完了時に user pause、R-1.4)
-paused  → running      (POST /unpause / restart 時の再 attach)
-paused  → cancelled    (paused 中の cancel — worker 不在なので明示遷移)
-paused  → failed       (resume 時に storage corruption を検出)
+[*] → pending          (POST /fit / /tune: 予約 create_and_reserve、retune / resume: create_child)
+pending → running      (受付 admit — launcher の入口、join の前。token を発行)
+pending → cancelled    (受付前の cancel / reset の settle、CANCEL つきの recover)
+pending → failed       (受付前の launch 失敗の settle、CANCEL の無い recover — P-0119 で追加)
+running → completed    (commit)
+running → failed       (commit / abort / dead child の reconcile commit / recover)
+running → cancelled    (CANCEL つきの commit・abort、force_release、recover)
+running → paused       (Tune の paused commit、unpause の abort で paused に戻す)
+paused  → running      (POST /unpause の受付。restart 時は paused のまま slot だけ戻る)
+paused  → cancelled    (paused 中の cancel / reset — token が無いので settle、CANCEL つきの recover)
+paused  → failed       (複数 paused の recover)
 ```
 
-- **INV-1**: `active_job_id` は同時に高々 1 つの running-or-paused job を保持。release は completion / cancel / exception / SIGKILL / WebSocket 切断 / browser 閉じる の 6 経路すべて（`paused` だけは例外で slot を保持し続ける — `POST /unpause` のための Optuna sqlite を所有しているため）。
+- **INV-1**: `active_job_id` は同時に高々 1 つの job を保持し、持てるのは INV-LC-3 の 3 つ（`pending` の予約、受付を通った live な run、`paused` の job）だけである。release は completion / cancel / exception / SIGKILL / WebSocket 切断 / browser 閉じる の 6 経路すべてで、どれも primitive の commit・settle・abort・force_release が行う（`paused` だけは例外で slot を保持し続ける — `POST /unpause` のための Optuna sqlite を所有しているため）。例外は Q1: thread mode で force-release された worker は次の協調点まで計算を続ける（何も commit しない）。
 - **INV-2**: `meta.json` は atomic write（tmpfile + `fsync` + `os.replace` + parent-dir `fsync`、`storage/versions.py:write_versioned_json`）。`kill -9` mid-write でも JSON 整合性が破れない。
-- **INV-3**: 上記の合法遷移以外は assert で reject。
+- **INV-3**: 上記の合法遷移以外は primitive の唯一の status 書き込み点が `IllegalTransitionError` で reject する（P-0119。旧 `JobStore.set_status` は削除）。
 - **INV-4**: `paused` job は trial-level checkpoint（Optuna sqlite `storage` + `study_name`）+ `meta.json` から完全復元可能。`load_if_exists=True` で同 study に re-attach し trial 番号が monotonic に蓄積される（`tests/integration/test_tune_resume_round_trip.py`）。
-- **INV-5**: cancel observation は monotonic — `is_cancel_requested(job_id)` が一度 True を返したら job 完了まで連続 True。
-- **INV-6**: subprocess crash recovery — 子 process が SIGKILL で死ぬと既存 reconcile path が `failed (reason="subprocess died")` で terminal write + slot release（専用 watchdog は audit の結果不要と判明）。
+- **INV-5**: cancel observation は monotonic — `is_cancel_requested(job_id)` が一度 True を返したら、その run の terminal commit まで連続 True。CANCEL を消すのは terminal を書いた commit / settle / abort / recover だけである（P-0119。force_release は子が読むため消さない）。200 で受け付けた cancel は失われない（INV-LC-4）。
+- **INV-6**: subprocess crash recovery — 子 process が SIGKILL で死ぬと、親の reconcile が run token の commit として `failed`（CANCEL があれば `cancelled`）を書き、slot を release する（P-0119。専用 watchdog は audit の結果不要と判明）。
 - **INV-7**: WebSocket 切断は active slot を release **しない**。進行中 job は subscriber 数に依らず terminal まで走り、restart 越しに paused slot を復元する。
+- **INV-8**（subprocess 子の SIGTERM）: SIGTERM handler は single-shot。1 回目の SIGTERM は main thread に `KeyboardInterrupt` を入れ、2 回目は `SIG_DFL` に戻して SIGTERM を送り直し、process を終わらせる（no-op ではない）。親の `proc.kill()` は後ろ盾として残る（`subprocess_runner._install_sigterm_handler`、`tests/regression/test_reg_0153_sigterm_runs_finally.py`）。
+
+**Job lifecycle の不変条件（P-0119、Issue #613 / #697）:** job の status、cancel / pause flag、active slot、job ごとの run token（親の memory にある世代番号）、lifecycle の reset 世代は、親 process の 1 つの lock（`JobLifecycle.lock`）の下でだけ動く。
+
+- **INV-LC-1**: 1 つの job について、受付を通った run は同時に高々 1 つである。違反: 同じ job id の worker が 2 つ起動する。
+- **INV-LC-2**: 終端は 1 度だけ書かれ、書き換えられない。終端の通知と metric は、その書き込みに従って 1 度だけ出る。起動時の `recover` が書いた終端も同じで、`recover` はその effects を返し、server の lifespan が broadcaster を作った直後に 1 度だけ出す（metric を 1 回数え、frame は P-0093 の replay cache に入るので、再接続した client に届く）。1 行の書き込みが失敗しても、その行だけを ERROR でログに残して非終端のまま残し（次の起動で再試行）、ほかの行の effects は返して出す。起動は止めない。`force_release` は `cancelled` の書き込みが公開されてから token を失効させ slot を解放する。書き込みが失敗すれば何も失効させず、run 自身の後の commit が終端を書ける。違反: 終端のあとに別の status が書かれる。あるいは、書かれなかった終端の通知、または 2 度目の通知が出る。
+- **INV-LC-3**: 親の slot を持てるのは次の 3 つだけである（thread / subprocess の両方）: `create_and_reserve` から受付までの `pending` の予約（同じ request の中）、受付を通った live な run、`paused` の job。違反: live な run の slot が空になる、または別の job が slot を持つ。例外は Q1 の force-release の後の thread だけである。
+- **INV-LC-4**: API が 200 で受け付けた cancel は失われず、再起動を越えても残る。受け付けは CANCEL file の書き込みが成功したときだけで、書けなければ cancel は 500 `CANCEL_NOT_PERSISTED` を返し、memory の flag も立てない（pause も同じで 500 `PAUSE_NOT_PERSISTED`）。それより後に書かれる終端は `cancelled` である（Q2: worker が先に結果を出していても `cancelled`。結果の sidecar は disk に残るが、workspace には結果を記録しない — `record_completion` は結果なしで呼ばれ、`current_job_id` はその job を指す）。terminal の書き込みが失敗し続けて run を手放す（`abandon`）ときも CANCEL は消さず、再起動の `recover` が `cancelled` を書く。thread / subprocess の両方で成り立つ。違反: cancel に 200 を返した job が、`failed`・`completed`・`paused` で終わる。
+- **INV-LC-5**: 失効した token による操作は捨てられ、ログに残る（`event='lifecycle.stale_commit_dropped'` / `lifecycle.stale_write_dropped` / `lifecycle.stale_frame_dropped` / `lifecycle.stale_outcome_dropped`）。対象は、status の書き込み、slot の解放、flag の消去、通知、結果と warning の書き込み、古い世代の outcome である。worker の progress と warning の frame（thread mode の callback、subprocess の JSONL の中継）は送る時点で token を確かめる: token の失効と frame の送信は同じ emit gate（`JobLifecycle._emit_gate`、lifecycle lock の内側の葉）を通るので、失効の後に frame は出ない。
+- **INV-LC-6**: reset が始まったあとは、それより前に取得された reset 世代の受付は通らない。reset 世代は `/fit`・`/tune` では予約と同じ lock の下、retune / resume では `create_child` と同じ lock の下、unpause では request の受信時に取得し、受付に引数で渡す（job の共有の欄には書かない）。
+
+**lock の順序（P-0119）:** `JobLifecycle.lock` → `ActiveJobSlot` の lock → `JobControlFlags` の cancel / pause の lock（葉）。`JobLifecycle.lock` → `JobLifecycle._emit_gate`（葉。frame を送る側は gate だけを取り、lifecycle lock は取らない）。`WorkspaceState` の lock とは交わらない（どちらかを持ったまま他方を取らない）。`ProgressBroadcaster` と metrics は lock の外でだけ呼ぶ: primitive の操作は書くべき通知（`LifecycleEffects`）を返し、呼び出し側が lock を出てから 1 度だけ出す。lock は join・`Popen`・子の wait・broadcast の間は持たない。`meta.json` の書き込みはすべてこの lock の下で行う（status-free の `update()` を含む）。
+
+**reset の順序（P-0119、不変）:** (1) 1 つの lock 区間で lifecycle の reset 世代を進め、active な job を cancel する（live な token には CANCEL、token の無い `pending` / `paused` は settle で `cancelled`）→ (2) lock の外で slot の解放を待ち、解放されなければ `force_release`（token を失効させ、終端でなければ `cancelled` を書き、slot を解放。CANCEL は残す）→ (3) `ws.reset()` が P-0114 の workspace epoch を進める。2 つの世代は所有者・取得点・lock が別なので統合しない。
+
+**API の挙動（P-0119）:** 2 本目の並行 unpause は join を待たずに 400 `JOB_NOT_PAUSED`。reset より古い unpause、受付後の join の失敗は 409 `JOB_CONFLICT`（join の失敗後、job は `paused` に戻る）。retune / resume の受付で slot が他の job に取られていれば 409 `JOB_CONFLICT`（子は `failed` に settle）。token の無い `pending` への cancel は 200 で `cancelled`。準備中の job は `running` なので Pause を受け付け（最初の callback で止まる）、Delete は 400 `JOB_RUNNING` で拒否される。応答の形は変わらない。
 
 #### 3.4.3 DataRef（データ参照）
 
@@ -421,6 +441,10 @@ class DataRef:
 
 **`model/` の保存形式（lizyml の `format_version`）:** `model/` は lizyml が書き、形式は lizyml が持つ。lizyml 0.21 は `format_version` 5 で書き、lizyml 0.20 以前はそれを読めない（一方向）。0.21 は形式 1〜4 も読み、予測する。そのため、0.20 で作った job は 0.21 でも開け、推論・export-code・モデルの export ができる（`tests/fixtures/lizyml020/`、P-0117 D1）。ただし、0.21 でモデルを export すると形式 5 になり、0.20 以前では読めない。lizyml を上げる前に job の保存先をバックアップする。
 - `meta.json.parent_job_id`: Re-tune / Resume の child job では parent の job_id を参照する。非 child job では `null`。
+- **`CANCEL` / `PAUSE`（P-0119）:** cancel / pause の flag file。立てるのも消すのも親の primitive だけである（子は読むだけ）。force-release した終端の job の dir には `CANCEL` が残る場合がある（子が読むため消さない）。終端の job の flag は誰も読まない。
+- **subprocess の子が準備中に死んだとき（P-0119、#697 窓1）:** 子の stdout / stderr は親が開いた `execution.log` に追記される。子が `_child_main` の準備（引数の読み込みからデータの読み込みまで）で終われば、`execution.log` にはそれまでに子が書いたもの（空のこともある）だけが残り、`--- captured Python logger records ---` の節は無い。job の status と `error` は親の reconcile の commit が書く（CANCEL があれば `cancelled`、無ければ `failed`、error は `Subprocess exited with code N without persisting a terminal status`）。
+- **`outcome.json`（P-0119、Q3）:** subprocess の子の結果。子は `meta.json` を書かず、run の終わりにこの 1 つの file を atomic に書く（status・error・frame の code と message・`fit_result`・`tune_result`・`model_path`、受付が引数で渡した run 世代つき）。親の reconcile が読んで消し、世代が live な token と一致すれば結果を status-free に書いてから status を commit する（cancel が受け付けられていれば `cancelled`、Q2）。一致しなければ古い outcome として捨ててログに残し、outcome の無い場合と同じく `failed`（CANCEL があれば `cancelled`）を commit する。受付は前の run の `outcome.json` を消す。子の warning は JSONL で親に届き、親が token の下で `meta.json` に保存してから送る。子の終端・`paused` の frame は中継しない（親の commit が 1 度だけ出す）。force-release の後も生きている子が書くのは `outcome.json` と checkpoint だけで、親はその outcome を捨てる。
+- **`LIZYSTUDIO_TEST_CHILD_BARRIER_DIR`（test 専用）:** 設定されていると、subprocess の子は `setup` / `core_entry` の各点で `<dir>/<point>.reached` を作り、`<dir>/<point>.release` ができるまで待つ（`services/_child_barrier.py`）。本番では設定しない。未設定なら 1 回の `is None` 確認だけで、親は読まない。
 - `meta.json.warnings`: job の実行中にバックエンドが出した警告の文面の一覧（P-0117 D4）。lizyml 0.21 の H-0140 のメモリ見積もりの警告（`num_leaves` が 16384 以上か、見積もりが 1 GiB 以上）などが入る。
   - 取り込むのは、job の thread で出た `UserWarning`（とその派生）と、`lizyml` の logger の `WARNING` 以上の記録である。thread と subprocess の両方のモードで、`_run_job_core` が取り込む（`services/_job_warnings.py`）。
   - 取り込みの仕組みは、プロセスの開始時に 1 回だけ入れる（server の lifespan と subprocess の子）。`warnings.showwarning` の dispatcher と `lizyml` の logger の handler を入れ、`lizyml.core.resource_warning` の logger を INFO にする。どれも戻さない。job は自分の thread を登録・解除するだけで、`warnings.showwarning` には触れない。
@@ -2038,6 +2062,8 @@ Optimization History → Best Params → Score → Learning Curve → Plots（�
 | **Delete** | ジョブの削除。確認ダイアログあり | 全状態（Running 以外） |
 | **Cancel** | 実行中 / paused ジョブのキャンセル。確認ダイアログあり（paused 用に本文を切り替え）(P-0099 v3-20c) | Running / Paused |
 
+P-0119: 受付が launcher の入口で `running` を書くため、準備中（worker が最初の callback に達する前）の job も Running として表示される。準備中にも Pause（最初の callback で止まる）と Cancel が出て、Delete は出ない（API も 400 `JOB_RUNNING` で拒否）。`pending` は request の中の短い間だけになる。UI の変更は無い。
+
 **Re-fit の動作:**
 1. 選択ジョブの Config（data / features / split / model / training / evaluation）を Workspace の各パネルに反映
 2. Workspace 画面（`/`）に遷移
@@ -2554,9 +2580,9 @@ Workspace の `workspace_result` は完了時に自動更新される。
 | POST | `/api/jobs/{job_id}/export` | モデル/レポートを指定パスにExport |
 | GET | `/api/jobs/{job_id}/export-code` | LizyML 非依存コードを ZIP でダウンロード（H-0027） |
 | GET | `/api/jobs/{job_id}/log` | 実行ログ取得（H-0006） |
-| POST | `/api/jobs/{job_id}/cancel` | Running / Paused ジョブのキャンセル（H-0011 / P-0099 v3-20c） |
-| POST | `/api/jobs/{job_id}/pause` | Running Tune を paused に遷移（次の trial 完了時）。Fit ジョブは `JOB_NOT_PAUSEABLE`、running 以外は `JOB_NOT_RUNNING`（P-0099 v3-20d） |
-| POST | `/api/jobs/{job_id}/unpause` | Paused Tune を同 job_id で in-place 再開（Optuna `load_if_exists=True` で trial 継続）。data 再ロード必須。paused 以外は `JOB_NOT_PAUSED`、data 未読込は `WORKSPACE_NO_DATA`（P-0099 v3-20d）。継続できない study は起動前に `PICKLE_INCOMPATIBLE` で拒否し、job は paused のまま（P-0116 D4）。別の lizyml の major.minor で一時停止した job も同じく拒否する（checkpoint sidecar `model_meta.json` の `lizyml_version` で判定、P-0117 D3） |
+| POST | `/api/jobs/{job_id}/cancel` | Running / Paused / Pending ジョブのキャンセル（H-0011 / P-0099 v3-20c / P-0119）。live な run には CANCEL を立てて 200（その run の終端は `cancelled`）、token の無い `pending` / `paused` は即座に `cancelled` に settle して 200、終端は 400 `JOB_NOT_RUNNING`、CANCEL file を書けなければ 500 `CANCEL_NOT_PERSISTED`（受け付けない） |
+| POST | `/api/jobs/{job_id}/pause` | Running Tune を paused に遷移（次の trial 完了時）。Fit ジョブは `JOB_NOT_PAUSEABLE`、live な run が無い（`pending` / `paused` / 終端）か cancel が保留中なら `JOB_NOT_RUNNING`（P-0099 v3-20d / P-0119）。準備中の job も live な run なので受け付け、最初の callback で止まる |
+| POST | `/api/jobs/{job_id}/unpause` | Paused Tune を同 job_id で in-place 再開（Optuna `load_if_exists=True` で trial 継続）。data 再ロード必須。paused 以外は `JOB_NOT_PAUSED`、data 未読込は `WORKSPACE_NO_DATA`（P-0099 v3-20d）。継続できない study は起動前に `PICKLE_INCOMPATIBLE` で拒否し、job は paused のまま（P-0116 D4）。別の lizyml の major.minor で一時停止した job も同じく拒否する（checkpoint sidecar `model_meta.json` の `lizyml_version` で判定、P-0117 D3）。受付は join の前の CAS で、2 本目の並行 unpause は待たずに `JOB_NOT_PAUSED`、reset より古い unpause・受付後の join の失敗は 409 `JOB_CONFLICT`（job は `paused` に戻る、P-0119） |
 | POST | `/api/jobs/{job_id}/retune` | 完了 Tune を起点に再チューニング子ジョブを作成（H-0062） |
 | POST | `/api/jobs/{job_id}/resume` | 失敗/中断 Tune の再開子ジョブを作成（H-0062 Phase B。`unpause` とは別 — こちらは lineage child を作る） |
 | GET | `/api/jobs/{job_id}/lineage` | ジョブ系譜のサブツリー（H-0062） |
@@ -2708,7 +2734,7 @@ Workspace の `workspace_result` は完了時に自動更新される。
 
 **Schema SSOT (H-0069):** 上記 6 variant は `src/lizystudio/ws/messages.py` の Pydantic discriminated union として単一定義される。サーバ側送信は `WsMessage.model_dump_json(exclude_none=True)` を通り、フロントは生成 `schema.d.ts` から `WsMessage` 型を import する。optional フィールド (`fold_results` / `trial_results`) は値が存在するときだけ wire に現れ、`null` フィールドはシリアライズしない（既存 wire format と bit-identical）。
 
-**Terminal replay (P-0093 / Issue #327):** `completed` / `error` メッセージは `ProgressBroadcaster._last_terminal` に per-jobId でキャッシュされ、subscribe より前に送信された場合でも late subscriber に replay される。TTL は default 5 分（環境変数 `LIZYSTUDIO_WS_TERMINAL_TTL_S` で上書き可）。これにより高速 fit (< 3 秒) の subscribe-vs-send race が解消される。INV-1: terminal メッセージは subscribe タイミングに関わらず subscriber に **少なくとも一度** 届く。INV-2: live broadcast 経路と replay 経路は subscriber の登録タイミングを境に disjoint なので、同一 subscriber への重複配信は発生しない。replay 発生は `lizystudio_progress_terminal_replayed_total` Counter で観測可能。
+**Terminal replay (P-0093 / Issue #327):** `completed` / `error` メッセージは `ProgressBroadcaster._last_terminal` に per-jobId でキャッシュされ、subscribe より前に送信された場合でも late subscriber に replay される。TTL は default 5 分（環境変数 `LIZYSTUDIO_WS_TERMINAL_TTL_S` で上書き可）。これにより高速 fit (< 3 秒) の subscribe-vs-send race が解消される。INV-1: terminal メッセージは subscribe タイミングに関わらず subscriber に **少なくとも一度** 届く。INV-2: live broadcast 経路と replay 経路は subscriber の登録タイミングを境に disjoint なので、同一 subscriber への重複配信は発生しない。P-0119: 終端 frame（と `paused`）は、終端を実際に書いた primitive の操作の effects として 1 度だけ出る。subprocess mode では子の exit と reconcile の commit の後に親から出る（子の frame は中継しない）。replay 発生は `lizystudio_progress_terminal_replayed_total` Counter で観測可能。
 
 進捗追跡の内部実装: 子プロセス → 親プロセスの JSONL 経路は `services/subprocess_runner.py` の独自 dict 形式を保持しており、親プロセスの `_forward_progress` が `WsMessage` への変換を担う。JSONL の wire は `job_id` を含まない（子プロセスは自 job を知らない前提）が、外部に露出しない内部通信のため SSOT 対象外。
 
@@ -2997,6 +3023,8 @@ lizystudio_active_jobs 0.0
 | `JOB_NOT_RUNNING` | Cancel / Pause は running（または paused — Cancel のみ）job が対象 (P-0099 v3-20c/d) | 400 |
 | `JOB_NOT_PAUSEABLE` | Pause は tune job のみ対象（fit job は paused にできない）(P-0099 v3-20d) | 400 |
 | `JOB_NOT_PAUSED` | Unpause は paused job のみ対象 (P-0099 v3-20d) | 400 |
+| `CANCEL_NOT_PERSISTED` | cancel の CANCEL file を書けなかった。cancel は受け付けていない（P-0119 INV-LC-4） | 500 |
+| `PAUSE_NOT_PERSISTED` | pause の PAUSE file を書けなかった。pause は受け付けていない（P-0119） | 500 |
 
 > `LegacyFormatProtectionError`（§3.4.4 / P-0103）は専用エラーコードを持たず、`INTERNAL_ERROR` (500) として surface する。発生条件（旧 format_version の disk ファイル上書き）は通常運用では起きないため。recovery 手順は環境変数 `LIZYSTUDIO_ALLOW_LEGACY_WRITE=1`。
 

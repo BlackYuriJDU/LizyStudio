@@ -32,6 +32,7 @@ from lizystudio.server import create_app
 from lizystudio.services.data import load_dataframe
 from lizystudio.services.jobs import JobStore
 from lizystudio.services.training import run_fit
+from tests.lifecycle_seed import admitted_sink
 
 pytestmark = pytest.mark.integration
 
@@ -102,6 +103,7 @@ def fitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str
         backend=LizyMLAdapter(),
         config=config,
         dataframe=train,
+        sink=admitted_sink(job_store, job, None),
     )
     assert done.status == "completed", done.error
 

@@ -39,6 +39,7 @@ from lizystudio.backends.types import DataRef
 from lizystudio.server import create_app
 from lizystudio.services.jobs import Job, JobStore
 from lizystudio.services.training import run_fit, run_tune
+from tests.lifecycle_seed import admitted_sink
 
 pytestmark = pytest.mark.integration
 
@@ -309,6 +310,7 @@ def test_export_code_on_a_tuned_job_of_the_installed_lizyml_is_not_refused(
         backend=LizyMLAdapter(),
         config=config,
         dataframe=pd.read_csv(TUNE_FIXTURE / "data.csv"),
+        sink=admitted_sink(job_store, job, None),
     )
     assert done.status == "completed", done.error
     assert done.model_path is not None
@@ -340,6 +342,7 @@ def test_other_shap_model_not_fit_on_a_current_job_stays_a_backend_error(
         backend=LizyMLAdapter(),
         config=config,
         dataframe=pd.read_csv(TUNE_FIXTURE / "data.csv"),
+        sink=admitted_sink(job_store, job, None),
     )
     assert done.status == "completed", done.error
     assert done.model_path is not None

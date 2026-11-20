@@ -246,9 +246,9 @@ test.describe("Re-tune / Resume / Lineage flow (H-0062)", () => {
     const { job_id: childId } = await retuneRes.json();
 
     // Issue cancel as soon as the child has started running.
-    // Poll briefly so we hit the `running` state instead of cancelling
-    // a still-pending job (which would also be a valid path but doesn't
-    // exercise the cancel-aware progress callback).
+    // P-0119: the child is admitted (status `running`) inside the /retune
+    // request, so the poll below returns at once and the cancel is 200 even
+    // while the child is still in setup (it then stops at its first callback).
     for (let i = 0; i < 30; i++) {
       const status = await (await request.get(`${API}/jobs/${childId}`)).json();
       if (

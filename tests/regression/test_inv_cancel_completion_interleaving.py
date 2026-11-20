@@ -37,6 +37,7 @@ import pytest
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services._training_core import _run_job_core
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import admitted_sink
 
 pytestmark = pytest.mark.unit
 
@@ -110,6 +111,7 @@ def test_inv5_cancel_request_between_cb_calls_lands_on_cancelled(
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert result.status == "cancelled", (
@@ -175,6 +177,7 @@ def test_inv5_cancel_completion_race_count_balanced_under_concurrency(
             job_store=store,
             broadcaster=None,
             execute_fn=execute_fn,
+            sink=admitted_sink(store, job, None),
         )
         return result.status
 
@@ -243,6 +246,7 @@ def test_inv5_cancel_after_terminal_does_not_overwrite_completed(
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, None),
     )
     assert result.status == "completed"
 

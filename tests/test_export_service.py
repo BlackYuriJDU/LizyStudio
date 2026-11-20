@@ -10,6 +10,7 @@ import pytest
 from lizystudio.backends.types import DataRef, FitSummary, PlotData
 from lizystudio.services.export import export_model, export_report
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -41,7 +42,7 @@ def completed_job(job_store: JobStore) -> Job:
         fold_count=5,
         params=[{"n_estimators": 100}],
     )
-    job_store.update(job)
+    seed_job(job_store, job)
     return job
 
 

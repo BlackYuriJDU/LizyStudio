@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import Depends
 from pydantic import BaseModel, ConfigDict
 
+from lizystudio.api._lifecycle_http import launch_reserved
 from lizystudio.api.deps import get_broadcaster
 from lizystudio.api.errors import (
     JobNotCompletedError,
@@ -151,6 +152,35 @@ def _require_valid_parent_config(ws: WorkspaceState, parent: Job) -> None:
     require_relaunchable_config(ws, parent.config)
 
 
+def _start_child(
+    job_store: JobStore,
+    broadcaster: ProgressBroadcaster,
+    child: Job,
+    reset_gen: int,
+    **kwargs: Any,
+) -> None:
+    """Launch a retune / resume child created with *reset_gen* (P-0119).
+
+    The launcher admits the child (claiming the slot when it is empty); a
+    slot held by another job, or a reset since ``create_child``, answers
+    409 ``JOB_CONFLICT`` and leaves the child settled.
+    """
+    from lizystudio.services.training import start_retune_async
+
+    launch_reserved(
+        job_store,
+        broadcaster,
+        child,
+        lambda: start_retune_async(
+            job_store=job_store,
+            broadcaster=broadcaster,
+            child_job=child,
+            reset_gen=reset_gen,
+            **kwargs,
+        ),
+    )
+
+
 @router.post("/{job_id}/retune", response_model=RetuneJobResponse)
 def retune_job(
     job_id: str,
@@ -159,9 +189,14 @@ def retune_job(
     ws: WorkspaceState = Depends(get_workspace),
     broadcaster: ProgressBroadcaster = Depends(get_broadcaster),
 ) -> dict[str, str]:
-    """Start a Re-tune child job from a completed parent Tune (H-0062)."""
-    from lizystudio.services.training import start_retune_async
+    """Start a Re-tune child job from a completed parent Tune (H-0062).
 
+    P-0119: the child is admitted when its launch starts, claiming the
+    empty slot. When another job holds the slot, or the workspace was
+    reset after the child was created, the answer is 409
+    ``JOB_CONFLICT`` and the child is settled (``failed`` or
+    ``cancelled``).
+    """
     parent = _get_job_or_404(job_id, job_store)
     if parent.status != "completed":
         raise JobNotCompletedError(job_id)
@@ -177,7 +212,7 @@ def retune_job(
     # thread eventually finishes (success / failure / cancellation).
     started = False
     try:
-        child = job_store.create(
+        child, reset_gen = job_store.create_child(
             backend_name=parent.backend_name,
             config=parent.config,
             data_ref=parent.data_ref,
@@ -200,12 +235,13 @@ def retune_job(
                 parent.job_id, job_store.get_locked_child(parent.job_id)
             )
 
-        start_retune_async(
+        _start_child(
+            job_store,
+            broadcaster,
+            child,
+            reset_gen,
             ws=ws,
-            job_store=job_store,
-            broadcaster=broadcaster,
             parent_job=parent,
-            child_job=child,
             n_trials=body.n_trials,
             expand_boundary=body.expand_boundary,
             boundary_threshold=body.boundary_threshold,
@@ -226,9 +262,11 @@ def resume_job(
     ws: WorkspaceState = Depends(get_workspace),
     broadcaster: ProgressBroadcaster = Depends(get_broadcaster),
 ) -> dict[str, str]:
-    """Resume a failed Tune Job from its last saved checkpoint (H-0062)."""
-    from lizystudio.services.training import start_retune_async
+    """Resume a failed Tune Job from its last saved checkpoint (H-0062).
 
+    P-0119: admission and the 409 ``JOB_CONFLICT`` answers are the same
+    as for ``POST /jobs/{job_id}/retune``.
+    """
     parent = _get_job_or_404(job_id, job_store)
     if parent.status != "failed":
         raise StudioError(
@@ -247,7 +285,7 @@ def resume_job(
     placeholder = _claim_retune_slot(job_id, job_store)
     started = False
     try:
-        child = job_store.create(
+        child, reset_gen = job_store.create_child(
             backend_name=parent.backend_name,
             config=parent.config,
             data_ref=parent.data_ref,
@@ -261,12 +299,13 @@ def resume_job(
                 parent.job_id, job_store.get_locked_child(parent.job_id)
             )
 
-        start_retune_async(
+        _start_child(
+            job_store,
+            broadcaster,
+            child,
+            reset_gen,
             ws=ws,
-            job_store=job_store,
-            broadcaster=broadcaster,
             parent_job=parent,
-            child_job=child,
             n_trials=n_trials,
             expand_boundary=None,
             boundary_threshold=None,

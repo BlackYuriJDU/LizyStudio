@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from lizystudio.backends.types import DataRef, TuningSummary
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import admitted_sink, seed_job
 
 pytestmark = pytest.mark.integration
 
@@ -54,7 +55,7 @@ def _make_completed_tune_job(
         metric_name="auc",
         direction="maximize",
     )
-    job_store.update(job)
+    seed_job(job_store, job)
 
     if with_checkpoint:
         job_dir = job_store.jobs_dir / job.job_id
@@ -98,7 +99,7 @@ def _make_failed_tune_job(
         metric_name="auc",
         direction="maximize",
     )
-    job_store.update(job)
+    seed_job(job_store, job)
 
     if with_checkpoint:
         job_dir = job_store.jobs_dir / job.job_id
@@ -119,7 +120,7 @@ def _make_completed_fit_job(client: TestClient, sample_data_ref: DataRef) -> str
         job_type="fit",
     )
     job.status = "completed"
-    job_store.update(job)
+    seed_job(job_store, job)
     return job.job_id
 
 
@@ -198,7 +199,7 @@ def test_delete_cascade_removes_subtree(
     )
     # Mark child as completed so the cascade guard does not trip
     child.status = "completed"
-    job_store.update(child)
+    seed_job(job_store, child)
 
     res = client.delete(f"/api/jobs/{parent_id}?cascade=true")
     assert res.status_code == 200
@@ -275,7 +276,7 @@ def test_retune_accepts_grandchild(
         metric_name="auc",
         direction="maximize",
     )
-    job_store.update(child)
+    seed_job(job_store, child)
     # Give the child its own checkpoint + sidecar so the full happy path
     # runs and the API accepts the retune of a retune.
     child_dir = job_store.jobs_dir / child.job_id
@@ -398,7 +399,7 @@ def test_auto_remaining_trials_with_no_tune_result(
     )
     job.status = "failed"
     job.tune_result = None
-    job_store.update(job)
+    seed_job(job_store, job)
 
     parent = job_store.get(job.job_id)
     assert parent is not None
@@ -442,7 +443,7 @@ def test_auto_remaining_trials_multi_round_uses_n_rounds(
         metric_name="auc",
         direction="maximize",
     )
-    job_store.update(job)
+    seed_job(job_store, job)
 
     parent = job_store.get(job.job_id)
     assert parent is not None
@@ -794,7 +795,7 @@ def test_cascade_delete_returns_removed_id_list(
     )
     for j in (child_a, grand, child_b):
         j.status = "completed"
-        job_store.update(j)
+        seed_job(job_store, j)
 
     res = client.delete(f"/api/jobs/{parent_id}?cascade=true")
     assert res.status_code == 200
@@ -931,8 +932,13 @@ def test_retune_response_body_schema(
 def test_retune_release_lock_when_child_create_fails(
     client: TestClient, sample_data_ref: DataRef
 ) -> None:
-    """If JobStore.create raises, the placeholder parent lock must be
-    released so the parent can be retried."""
+    """If the child creation raises, the placeholder parent lock must be
+    released so the parent can be retried.
+
+    P-0119 (受付: the child is created with the request's reset generation):
+    the route creates the child through ``JobStore.create_child``, so the
+    failure is injected there instead of ``JobStore.create``.
+    """
     from unittest.mock import patch
 
     parent_id = _make_completed_tune_job(client, sample_data_ref)
@@ -940,7 +946,7 @@ def test_retune_release_lock_when_child_create_fails(
     job_store: JobStore = app.state.job_store
 
     with patch.object(
-        job_store, "create", side_effect=RuntimeError("synthetic create error")
+        job_store, "create_child", side_effect=RuntimeError("synthetic create error")
     ):
         try:
             res = client.post(f"/api/jobs/{parent_id}/retune", json={"n_trials": 3})
@@ -1025,6 +1031,7 @@ def test_retune_end_to_end_with_real_lizyml(
         backend=ws.backend,
         config=parent_config,
         dataframe=df,
+        sink=admitted_sink(job_store, parent_job, None),
     )
     parent_reloaded = job_store.get(parent_job.job_id)
     assert parent_reloaded is not None

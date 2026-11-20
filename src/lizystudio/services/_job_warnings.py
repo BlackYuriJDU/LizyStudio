@@ -107,6 +107,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, TextIO
 
 if TYPE_CHECKING:
+    from lizystudio.services._job_lifecycle_types import RunToken
     from lizystudio.services.jobs import Job, JobStore
     from lizystudio.ws.progress import ProgressBroadcaster
 
@@ -181,7 +182,15 @@ class JobWarningCollector:
         job_store: JobStore,
         broadcaster: ProgressBroadcaster | None,
         job_logger: logging.Logger,
+        token: RunToken | None = None,
+        persist: bool = True,
     ) -> None:
+        # P-0119: with a run token, a warning stored or sent after the run
+        # was revoked (force-release) is dropped and logged. ``persist`` is
+        # False in the subprocess child, which writes no ``meta.json``: the
+        # parent persists the warning it relays (PR-B, Codex r1-1).
+        self._token = token
+        self._persist = persist
         self._job = job
         self._job_store = job_store
         self._broadcaster = broadcaster
@@ -222,14 +231,32 @@ class JobWarningCollector:
             return
         self._seen.add(text)
         self._job.warnings = [*self._job.warnings, text]
+        if self._persist and not self._persisted():
+            return
+        self._send(text)
+
+    def _persisted(self) -> bool:
         try:
-            self._job_store.update(self._job)
+            return self._job_store.write_results(self._job, self._token)
         except OSError:
             _logger.warning(
                 "Failed to persist job warnings for %s", self._job.job_id, exc_info=True
             )
-        if self._broadcaster is not None:
-            self._broadcaster.send_warning(self._job.job_id, text)
+            return True
+
+    def _send(self, text: str) -> None:
+        broadcaster = self._broadcaster
+        if broadcaster is None:
+            return
+        job_id = self._job.job_id
+        if self._token is None:
+            broadcaster.send_warning(job_id, text)
+            return
+        # Fenced at send time (Codex r1-4): a run revoked after the write
+        # above sends nothing.
+        self._job_store.emit_if_live(
+            self._token, lambda: broadcaster.send_warning(job_id, text)
+        )
 
 
 def _is_captured(record: logging.LogRecord) -> bool:

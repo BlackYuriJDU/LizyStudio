@@ -24,6 +24,7 @@ from lizystudio.services.subprocess_runner import (
     _forward_progress,
     run_job_in_subprocess,
 )
+from tests.lifecycle_seed import admit_running
 
 pytestmark = pytest.mark.unit
 
@@ -139,6 +140,7 @@ class TestRunJobInSubprocess:
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(sample_csv),
+            token=admit_running(job_store, job),
         )
         assert result_job.status == "completed"
         assert result_job.fit_result is not None
@@ -165,6 +167,7 @@ class TestRunJobInSubprocess:
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(sample_csv),
+            token=admit_running(job_store, job),
         )
         assert result_job.status == "completed"
         assert result_job.fit_result is not None
@@ -191,6 +194,7 @@ class TestRunJobInSubprocess:
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(sample_csv),
+            token=admit_running(job_store, job),
         )
         # At minimum, send_completed should have been called
         assert broadcaster.send_completed.called or broadcaster.send_error.called
@@ -216,6 +220,7 @@ class TestRunJobInSubprocess:
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(sample_csv),
+            token=admit_running(job_store, job),
         )
         assert result_job.status == "failed"
         assert result_job.error is not None
@@ -365,6 +370,7 @@ class TestRetuneArgValidation:
                 mode="retune",
                 parent_job_id=None,
                 retune_n_trials=5,
+                token=admit_running(job_store, job),
             )
 
     def test_retune_with_zero_n_trials_raises(
@@ -388,6 +394,7 @@ class TestRetuneArgValidation:
                 mode="retune",
                 parent_job_id="parent-xyz",
                 retune_n_trials=0,
+                token=admit_running(job_store, job),
             )
 
     def test_retune_with_negative_n_trials_raises(
@@ -411,6 +418,7 @@ class TestRetuneArgValidation:
                 mode="retune",
                 parent_job_id="parent-xyz",
                 retune_n_trials=-1,
+                token=admit_running(job_store, job),
             )
 
     def test_retune_valid_args_populate_args_file(
@@ -473,6 +481,7 @@ class TestRetuneArgValidation:
             retune_n_trials=7,
             retune_expand_boundary=False,
             retune_boundary_threshold=0.25,
+            token=admit_running(job_store, job),
         )
 
         assert captured["args"]["parent_job_id"] == "parent-abc"
@@ -565,6 +574,7 @@ class TestSubprocessTimeoutAndErrors:
             broadcaster=None,
             backend_name="lizyml",
             data_path="/nonexistent.csv",
+            token=admit_running(job_store, job),
         )
 
         # kill() must have been called because first wait() timed out.
@@ -618,6 +628,7 @@ class TestSubprocessTimeoutAndErrors:
                 return None
             return original_get(job_id)
 
+        token = admit_running(job_store, job)
         monkeypatch.setattr(job_store, "get", _fake_get)
 
         result_job = run_job_in_subprocess(
@@ -626,6 +637,7 @@ class TestSubprocessTimeoutAndErrors:
             broadcaster=None,
             backend_name="lizyml",
             data_path="/nonexistent.csv",
+            token=token,
         )
 
         assert result_job.status == "failed"
@@ -676,13 +688,18 @@ class TestForwardProgress:
         assert kwargs["trial_results"] == [{"trial": 0, "value": 0.8}]
 
     def test_completed_and_error_dispatch(self) -> None:
+        """Overturned by P-0119 (子: "親は、子の終端の frame を転送しない"):
+        the child's ``completed`` / ``error`` lines are not relayed; the
+        parent's commit of the child's outcome emits the one terminal frame.
+        Before P-0119 they were forwarded to ``send_completed`` / ``send_error``.
+        """
         b = MagicMock()
         _forward_progress('{"type": "completed"}', "job-1", b)
-        b.send_completed.assert_called_once_with("job-1")
         _forward_progress(
             '{"type": "error", "message": "bad", "code": "FIT_ERROR"}', "job-1", b
         )
-        b.send_error.assert_called_once_with("job-1", "bad", code="FIT_ERROR")
+        assert b.send_completed.call_count == 0
+        assert b.send_error.call_count == 0
 
     def test_paused_dispatch_forwards_to_send_paused(self) -> None:
         """P-0099 v3-20e regression — the JSONL line ``{"type":
@@ -691,6 +708,10 @@ class TestForwardProgress:
         parent broadcaster's ``send_paused`` so WS subscribers see the
         transition. The CI failure for PR #427 traced to this missing
         case in ``_forward_progress``.
+
+        Overturned by P-0119 (子: the ``paused`` frame is not forwarded): the
+        parent's ``paused`` commit of the child's outcome sends the one
+        ``WsPaused`` frame instead.
         """
         b = MagicMock()
         _forward_progress(
@@ -698,9 +719,7 @@ class TestForwardProgress:
             "job-1",
             b,
         )
-        b.send_paused.assert_called_once_with(
-            "job-1", trial_number=5, message="Paused."
-        )
+        assert b.send_paused.call_count == 0
 
 
 # ---------------------------------------------------------------------------

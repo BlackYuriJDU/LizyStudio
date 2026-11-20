@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job, seed_status
 
 pytestmark = pytest.mark.integration
 
@@ -70,7 +71,7 @@ def test_retune_refuses_a_stored_stratified_regression_config(
         job_type="tune",
     )
     job.status = "completed"
-    _store(client).update(job)
+    seed_job(_store(client), job)
     _skip_checkpoint_gate(monkeypatch)
 
     _assert_refused(client.post(f"/api/jobs/{job.job_id}/retune", json={"n_trials": 5}))
@@ -87,7 +88,7 @@ def test_resume_refuses_a_stored_stratified_regression_config(
         job_type="tune",
     )
     job.status = "failed"
-    _store(client).update(job)
+    seed_job(_store(client), job)
     _skip_checkpoint_gate(monkeypatch)
 
     _assert_refused(client.post(f"/api/jobs/{job.job_id}/resume", json={"n_trials": 5}))
@@ -108,8 +109,8 @@ def test_unpause_refuses_a_stored_stratified_regression_config(
         data_ref=data_ref,
         job_type="tune",
     )
-    store.set_status(job.job_id, "running")
-    store.set_status(job.job_id, "paused")
+    seed_status(store, job.job_id, "running")
+    seed_status(store, job.job_id, "paused")
     store.claim_active(job.job_id)
     store.request_pause(job.job_id)
     started: list[Any] = []

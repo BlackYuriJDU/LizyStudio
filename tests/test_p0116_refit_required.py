@@ -24,6 +24,7 @@ from lizystudio.backends.lizyml.space_wire import names_routed_outside_model_par
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services.jobs import JobStore
 from lizystudio.services.training import verify_unpause_study
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -187,7 +188,7 @@ def completed_job(client: TestClient, tmp_path: Path) -> str:
     job.status = "completed"
     job.model_path = str(tmp_path / "model")
     job.fit_result = FitSummary(metrics={"auc": 0.9}, fold_count=3, params=[])
-    job_store.update(job)
+    seed_job(job_store, job)
     return job.job_id
 
 

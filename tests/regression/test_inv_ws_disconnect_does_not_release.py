@@ -42,6 +42,7 @@ import pytest
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import Job, JobStore
 from lizystudio.ws.progress import ProgressBroadcaster
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -77,7 +78,7 @@ def _create_with_status(
         job_type=job_type,
     )
     job.status = status  # type: ignore[assignment]
-    store.update(job)
+    seed_job(store, job)
     return job
 
 

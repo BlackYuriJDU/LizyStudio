@@ -48,6 +48,7 @@ from tests.integration.test_unpause_study_continuation import (
     _new_job,
     _PauseOnFirstTrial,
 )
+from tests.lifecycle_seed import admitted_sink
 
 pytestmark = pytest.mark.integration
 
@@ -70,13 +71,15 @@ def paused_job(tmp_path_factory: pytest.TempPathFactory) -> _PausedJob:
     jobs_dir = tmp_path_factory.mktemp("paused") / "jobs"
     job_store = JobStore(jobs_dir)
     job = _new_job(job_store, _CONFIG)
+    pauser = _PauseOnFirstTrial(job_store)
     paused = run_tune(
         job=job,
         job_store=job_store,
         backend=LizyMLAdapter(),
         config=_CONFIG,
         dataframe=_dataframe(),
-        broadcaster=_PauseOnFirstTrial(job_store),  # type: ignore[arg-type]
+        broadcaster=pauser,  # type: ignore[arg-type]
+        sink=admitted_sink(job_store, job, pauser),
     )
     assert paused.status == "paused", paused.error
     sidecar = json.loads(
@@ -113,7 +116,10 @@ def server(
         job_store: JobStore = app.state.job_store
         job = job_store.get(paused_job.job_id)
         assert job is not None and job.status == "paused"
-        assert job_store.is_pause_requested(job.job_id) is True
+        # P-0119 (pause: "paused を書いて token を失効させ、slot を保ち、PAUSE
+        # を消す"): the paused commit clears PAUSE; before P-0119 the flag
+        # stayed set until /unpause cleared it.
+        assert job_store.is_pause_requested(job.job_id) is False
         app.state.workspace.set_data(
             pd.read_csv(FIXTURE_DIR / "data.csv"), job.data_ref
         )
@@ -177,6 +183,7 @@ def test_same_version_paused_tune_unpauses_and_continues_the_study(
         config=kw["config"],
         dataframe=kw["dataframe"],
         resume_from_existing_study=True,
+        sink=admitted_sink(kw["job_store"], kw["job"], None),
     )
     assert done.status == "completed", done.error
     assert _trial_count(server.job_dir, server.job_id) == _TRIALS_AFTER
@@ -254,7 +261,9 @@ def test_unpause_is_refused_before_the_job_starts(server: _Server, case: str) ->
     assert error["details"]["recovery_hint"] == "Start a new Tune"
     assert "Start a new Tune" in error["message"]
     assert server.launched == []
-    assert server.job_store.is_pause_requested(server.job_id) is True
+    # P-0119: the paused commit already cleared PAUSE (it was True before
+    # P-0119, when /unpause cleared it); a refused unpause sets nothing.
+    assert server.job_store.is_pause_requested(server.job_id) is False
     reloaded = server.job_store.get(server.job_id)
     assert reloaded is not None and reloaded.status == "paused"
     assert _trial_count(server.job_dir, server.job_id) == _TRIALS_BEFORE

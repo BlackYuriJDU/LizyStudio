@@ -12,7 +12,9 @@ from pathlib import Path
 import pytest
 
 from lizystudio.backends.types import DataRef
+from lizystudio.services._job_lifecycle_types import Outcome, RunToken
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -44,19 +46,34 @@ def _create_pending_job(store: JobStore) -> Job:
     )
 
 
+def _admit(store: JobStore, job: Job) -> RunToken:
+    """Admit one run of the ``pending`` *job* (claiming the empty slot)."""
+    return store.admit(
+        job.job_id,
+        expect="pending",
+        reset_gen=store.capture_reset_gen(),
+        slot_rule="claim",
+    )
+
+
 # --- Valid state transitions ---
 
 
 class TestValidTransitions:
-    """Verify all valid state transition paths persist correctly."""
+    """Verify all valid state transition paths persist correctly.
+
+    Overturned by P-0119 (状態と lock: "update() は status を書かない"): the
+    transitions are driven through the primitive — ``admit`` writes
+    ``running``, ``commit`` writes the outcome — instead of assigning
+    ``job.status`` and calling ``update()``, which now keeps the stored status.
+    """
 
     def test_pending_to_running(self, store: JobStore) -> None:
-        """pending -> running is a valid transition."""
+        """pending -> running is written by admission."""
         job = _create_pending_job(store)
         assert job.status == "pending"
 
-        job.status = "running"
-        store.update(job)
+        _admit(store, job)
 
         reloaded = store.get(job.job_id)
         assert reloaded is not None
@@ -65,27 +82,21 @@ class TestValidTransitions:
     def test_running_to_completed(self, store: JobStore) -> None:
         """running -> completed sets completed_at."""
         job = _create_pending_job(store)
-        job.status = "running"
-        store.update(job)
+        token = _admit(store, job)
 
-        job.status = "completed"
-        job.completed_at = "2026-04-06T00:00:00+00:00"
-        store.update(job)
+        assert store.commit(token, Outcome(status="completed")) is not None
 
         reloaded = store.get(job.job_id)
         assert reloaded is not None
         assert reloaded.status == "completed"
-        assert reloaded.completed_at == "2026-04-06T00:00:00+00:00"
+        assert reloaded.completed_at is not None
 
     def test_running_to_failed(self, store: JobStore) -> None:
         """running -> failed sets error message."""
         job = _create_pending_job(store)
-        job.status = "running"
-        store.update(job)
+        token = _admit(store, job)
 
-        job.status = "failed"
-        job.error = "Out of memory"
-        store.update(job)
+        store.commit(token, Outcome(status="failed", error="Out of memory"))
 
         reloaded = store.get(job.job_id)
         assert reloaded is not None
@@ -95,46 +106,48 @@ class TestValidTransitions:
     def test_running_to_cancelled(self, store: JobStore) -> None:
         """running -> cancelled via cancel request."""
         job = _create_pending_job(store)
-        job.status = "running"
-        store.update(job)
+        token = _admit(store, job)
 
-        store.request_cancel(job.job_id)
+        assert store.cancel(job.job_id).accepted is True
         assert store.is_cancel_requested(job.job_id)
-
-        job.status = "cancelled"
-        store.update(job)
+        # Q2: the accepted cancel wins over the run's own outcome.
+        effects = store.commit(token, Outcome(status="completed"))
+        assert effects is not None
+        assert effects.status == "cancelled"
 
         reloaded = store.get(job.job_id)
         assert reloaded is not None
         assert reloaded.status == "cancelled"
+        assert store.is_cancel_requested(job.job_id) is False
 
     def test_full_lifecycle_fit(self, store: JobStore) -> None:
         """Complete fit lifecycle: pending -> running -> completed."""
         from lizystudio.backends.types import FitSummary
 
-        job = _create_pending_job(store)
-        assert job.status == "pending"
+        reservation = store.create_and_reserve(
+            backend_name="lizyml",
+            config={"task": "binary"},
+            data_ref=_make_data_ref(),
+            job_type="fit",
+        )
+        assert reservation is not None
+        job, gen = reservation
+        assert store.active_job_id == job.job_id
+        token = store.admit(
+            job.job_id, expect="pending", reset_gen=gen, slot_rule="reserved"
+        )
 
-        # Claim active slot
-        assert store.claim_active(job.job_id)
-
-        # Start running
-        job.status = "running"
-        store.update(job)
-
-        # Complete with results
-        job.status = "completed"
-        job.completed_at = "2026-04-06T01:00:00+00:00"
+        # Results first (status-free), then the status commit.
         job.fit_result = FitSummary(
             metrics={"accuracy": 0.95},
             fold_count=5,
             params=[{"lr": 0.01}],
         )
         job.model_path = str(store.jobs_dir / job.job_id / "model")
-        store.update(job)
+        assert store.write_results(job, token) is True
+        store.commit(token, Outcome(status="completed"))
 
-        # Release active slot
-        store.release_active(job.job_id)
+        # The commit released the active slot.
         assert not store.has_active_job()
 
         # Verify persistence
@@ -156,7 +169,7 @@ class TestValidTransitions:
         )
 
         job.status = "running"
-        store.update(job)
+        seed_job(store, job)
 
         job.status = "completed"
         job.completed_at = "2026-04-06T02:00:00+00:00"
@@ -172,7 +185,7 @@ class TestValidTransitions:
             metric_name="accuracy",
             direction="maximize",
         )
-        store.update(job)
+        seed_job(store, job)
 
         reloaded = store.get(job.job_id)
         assert reloaded is not None
@@ -185,39 +198,39 @@ class TestValidTransitions:
 
 
 class TestTerminalStates:
-    """Verify terminal states (completed, failed, cancelled) are respected."""
+    """Verify terminal states (completed, failed, cancelled) are respected.
+
+    Overturned by P-0119 (INV-LC-2: a terminal is written once and never
+    rewritten): each terminal is committed through the primitive, then a
+    second commit — same token, or ``update()`` with another in-memory
+    status — leaves it unchanged.
+    """
+
+    @pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+    def test_terminal_is_written_once(self, store: JobStore, status: str) -> None:
+        job = _create_pending_job(store)
+        token = _admit(store, job)
+        assert store.commit(token, Outcome(status=status)) is not None  # type: ignore[arg-type]
+
+        assert store.commit(token, Outcome(status="failed")) is None
+        job.status = "running"
+        store.update(job)
+
+        reloaded = store.get(job.job_id)
+        assert reloaded is not None
+        assert reloaded.status == status
 
     def test_completed_is_terminal(self, store: JobStore) -> None:
         """A completed job stays completed after re-read."""
-        job = _create_pending_job(store)
-        job.status = "completed"
-        job.completed_at = "2026-04-06T00:00:00+00:00"
-        store.update(job)
-
-        reloaded = store.get(job.job_id)
-        assert reloaded is not None
-        assert reloaded.status == "completed"
+        self.test_terminal_is_written_once(store, "completed")
 
     def test_failed_is_terminal(self, store: JobStore) -> None:
         """A failed job stays failed after re-read."""
-        job = _create_pending_job(store)
-        job.status = "failed"
-        job.error = "Some error"
-        store.update(job)
-
-        reloaded = store.get(job.job_id)
-        assert reloaded is not None
-        assert reloaded.status == "failed"
+        self.test_terminal_is_written_once(store, "failed")
 
     def test_cancelled_is_terminal(self, store: JobStore) -> None:
         """A cancelled job stays cancelled after re-read."""
-        job = _create_pending_job(store)
-        job.status = "cancelled"
-        store.update(job)
-
-        reloaded = store.get(job.job_id)
-        assert reloaded is not None
-        assert reloaded.status == "cancelled"
+        self.test_terminal_is_written_once(store, "cancelled")
 
 
 # --- Concurrent operations ---
@@ -230,7 +243,7 @@ class TestConcurrentOperations:
         """Cancel request from one thread while another reads the job."""
         job = _create_pending_job(store)
         job.status = "running"
-        store.update(job)
+        seed_job(store, job)
 
         errors: list[Exception] = []
         barrier = threading.Barrier(2, timeout=5)
@@ -263,7 +276,7 @@ class TestConcurrentOperations:
         """Concurrent cancel + delete should not raise."""
         job = _create_pending_job(store)
         job.status = "running"
-        store.update(job)
+        seed_job(store, job)
 
         errors: list[Exception] = []
         barrier = threading.Barrier(2, timeout=5)
@@ -324,7 +337,7 @@ class TestConcurrentOperations:
         """Concurrent read during write returns a consistent state."""
         job = _create_pending_job(store)
         job.status = "running"
-        store.update(job)
+        seed_job(store, job)
 
         valid_statuses = {"running", "completed"}
         errors: list[str] = []
@@ -334,7 +347,7 @@ class TestConcurrentOperations:
             assert j is not None
             j.status = "completed"
             j.completed_at = "2026-04-06T00:00:00+00:00"
-            store.update(j)
+            seed_job(store, j)
 
         def reader() -> None:
             for _ in range(50):
@@ -395,7 +408,7 @@ class TestEdgeCases:
         """Deleting a running job removes files from disk."""
         job = _create_pending_job(store)
         job.status = "running"
-        store.update(job)
+        seed_job(store, job)
 
         assert store.delete(job.job_id)
         assert store.get(job.job_id) is None
@@ -410,7 +423,7 @@ class TestEdgeCases:
         j2 = _create_pending_job(store)
         j1.status = "completed"
         j1.completed_at = "2026-04-06T00:00:00+00:00"
-        store.update(j1)
+        seed_job(store, j1)
 
         pending_jobs = store.list(status="pending")
         completed_jobs = store.list(status="completed")

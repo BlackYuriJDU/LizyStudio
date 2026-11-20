@@ -8,6 +8,7 @@ import pytest
 
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -61,7 +62,7 @@ def test_list_with_filter(job_store: JobStore, sample_data_ref: DataRef) -> None
         job_type="fit",
     )
     job.status = "completed"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     job_store.create(
         backend_name="lizyml",
@@ -91,7 +92,7 @@ def test_update_with_results(job_store: JobStore, sample_data_ref: DataRef) -> N
         fold_count=5,
         params=[{"n_estimators": 100}],
     )
-    job_store.update(job)
+    seed_job(job_store, job)
 
     loaded = job_store.get(job.job_id)
     assert loaded is not None

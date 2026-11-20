@@ -291,20 +291,14 @@ class TestTuningFailed:
         assert self._tune_raising(original) is original
 
     def test_job_reports_the_tuning_failed_code(self) -> None:
-        from lizystudio.services._training_core import _apply_job_outcome
-
-        job = MagicMock(job_id="job_x", status="queued", error=None)
-        store = MagicMock()
-        broadcaster = MagicMock()
-
         def execute(_cb: Any) -> Any:
             raise TuningFailedError("All tuning trials failed. Check parameter ranges.")
 
-        _apply_job_outcome(job, store, broadcaster, execute_fn=execute, cb=MagicMock())
+        outcome, broadcaster = _outcome_and_frame(execute)
 
         message = "TuningFailedError: All tuning trials failed. Check parameter ranges."
-        assert job.status == "failed"
-        assert job.error.splitlines()[0] == message
+        assert outcome.status == "failed"
+        assert (outcome.error or "").splitlines()[0] == message
         broadcaster.send_error.assert_called_once_with(
             "job_x", message, code="TUNING_FAILED"
         )
@@ -523,21 +517,35 @@ class TestSearchSpaceRefused:
         assert self._tune_raising(original) is original
 
     def test_job_reports_the_space_refused_code(self) -> None:
-        from lizystudio.services._training_core import _apply_job_outcome
-
-        job = MagicMock(job_id="job_x", status="queued", error=None)
-        store = MagicMock()
-        broadcaster = MagicMock()
         refusal = f"{_REFUSED} (max_bin): off grid."
 
         def execute(_cb: Any) -> Any:
             raise SearchSpaceRefusedError(refusal, dims=("max_bin",))
 
-        _apply_job_outcome(job, store, broadcaster, execute_fn=execute, cb=MagicMock())
+        outcome, broadcaster = _outcome_and_frame(execute)
 
         message = f"SearchSpaceRefusedError: {refusal}"
-        assert job.status == "failed"
-        assert job.error.splitlines()[0] == message
+        assert outcome.status == "failed"
+        assert (outcome.error or "").splitlines()[0] == message
         broadcaster.send_error.assert_called_once_with(
             "job_x", message, code="SEARCH_SPACE_REFUSED"
         )
+
+
+def _outcome_and_frame(execute: Any) -> tuple[Any, MagicMock]:
+    """The outcome a worker exit maps to, and the frame its commit emits.
+
+    P-0119: ``_apply_job_outcome`` (which wrote the status itself) became
+    ``execute_outcome`` (which only describes the outcome); the frame comes
+    from the effects of the commit that publishes it. The expectations —
+    ``failed``, the message, the code — are unchanged.
+    """
+    from lizystudio.services._job_lifecycle import JobLifecycle
+    from lizystudio.services._job_outcome import execute_outcome
+    from lizystudio.services._job_sinks import emit_effects
+
+    job = MagicMock(job_id="job_x", job_type="tune")
+    outcome = execute_outcome(job, execute, MagicMock(), MagicMock())
+    broadcaster = MagicMock()
+    emit_effects(MagicMock(), broadcaster, JobLifecycle._effects(job, outcome))
+    return outcome, broadcaster

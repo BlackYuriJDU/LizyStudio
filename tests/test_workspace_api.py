@@ -18,6 +18,8 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from tests.lifecycle_seed import admit_running, seed_job
+
 pytestmark = pytest.mark.integration
 
 # ---------------------------------------------------------------------------
@@ -200,7 +202,7 @@ def test_status_no_disk_restore(
     )
     job.status = "completed"
     job.fit_result = FitSummary(metrics={"auc": 0.9}, fold_count=5, params=[])
-    job_store.update(job)
+    seed_job(job_store, job)
 
     # Plant job_id into workspace (simulates page refresh)
     ws.current_job_id = job.job_id
@@ -279,9 +281,9 @@ def _seed_running_holder(job_store: Any) -> str:
         ),
         job_type="fit",
     )
-    holder.status = "running"
-    job_store.update(holder)
-    assert job_store.claim_active(holder.job_id)
+    # P-0119: a live run is an admitted run (``running`` + token + slot).
+    assert job_store.active_job_id is None
+    admit_running(job_store, holder)
     return holder.job_id
 
 

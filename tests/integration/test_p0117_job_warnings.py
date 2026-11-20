@@ -34,6 +34,7 @@ from lizystudio.services.data import load_dataframe
 from lizystudio.services.jobs import Job, JobStore
 from lizystudio.services.subprocess_runner import run_job_in_subprocess
 from lizystudio.services.training import run_fit, run_tune
+from tests.lifecycle_seed import admit_running, admitted_sink
 
 pytestmark = pytest.mark.integration
 
@@ -144,6 +145,7 @@ def _run(
             broadcaster=broadcaster,  # type: ignore[arg-type]
             backend_name="lizyml",
             data_path=str(data),
+            token=admit_running(store, job),
         )
     runner = run_tune if job_type == "tune" else run_fit
     return runner(
@@ -153,6 +155,7 @@ def _run(
         config=config,
         dataframe=frame,
         broadcaster=broadcaster,  # type: ignore[arg-type]
+        sink=admitted_sink(store, job, broadcaster),
     )
 
 

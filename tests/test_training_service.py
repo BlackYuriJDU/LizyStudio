@@ -25,6 +25,12 @@ from lizystudio.services.training import (
     run_tune,
 )
 from lizystudio.services.workspace import WorkspaceState
+from tests.lifecycle_seed import (
+    admit_running,
+    admitted_sink,
+    reserve_for_launch,
+    seed_job,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -86,6 +92,7 @@ def test_run_fit_success(
         backend=mock_backend,
         config={"task": "binary"},
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
     assert result.status == "completed"
     assert result.fit_result is not None
@@ -117,6 +124,7 @@ def test_run_fit_with_progress(
         backend=mock_backend,
         config={},
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
     # Verify a progress callback was passed to backend.fit
     mock_backend.fit.assert_called_once()
@@ -143,6 +151,7 @@ def test_run_fit_failure(
         backend=mock_backend,
         config={},
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
     assert result.status == "failed"
     assert "Training failed" in (result.error or "")
@@ -171,6 +180,7 @@ def test_run_tune_success(
         backend=mock_backend,
         config=config,
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
     assert result.status == "completed"
     assert result.tune_result is not None
@@ -209,6 +219,7 @@ def test_run_tune_failure(
         backend=mock_backend,
         config={},
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
     assert result.status == "failed"
     assert "Tune error" in (result.error or "")
@@ -242,6 +253,7 @@ def test_run_fit_propagates_config_to_backend(
         backend=mock_backend,
         config=config,
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
     actual_config = mock_backend.create_model.call_args[0][0]
     assert actual_config == config
@@ -270,6 +282,7 @@ def test_run_fit_config_change_propagates(
         backend=mock_backend,
         config=config_a,
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job_a, None),
     )
 
     job_b = job_store.create(
@@ -284,6 +297,7 @@ def test_run_fit_config_change_propagates(
         backend=mock_backend,
         config=config_b,
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job_b, None),
     )
 
     calls = mock_backend.create_model.call_args_list
@@ -534,6 +548,7 @@ def test_run_fit_empty_dataframe(
         backend=mock_backend,
         config={"task": "binary"},
         dataframe=empty_df,
+        sink=admitted_sink(job_store, job, None),
     )
     assert result.status == "failed"
     assert "Empty data" in (result.error or "")
@@ -562,6 +577,7 @@ def test_run_fit_dataframe_with_nan(
         backend=mock_backend,
         config={"task": "binary"},
         dataframe=nan_df,
+        sink=admitted_sink(job_store, job, None),
     )
     # NaN handling is backend responsibility — job should complete
     assert result.status == "completed"
@@ -589,6 +605,7 @@ def test_run_fit_dataframe_with_inf(
         backend=mock_backend,
         config={"task": "binary"},
         dataframe=inf_df,
+        sink=admitted_sink(job_store, job, None),
     )
     assert result.status == "completed"
 
@@ -604,27 +621,38 @@ def test_concurrent_fit_blocked(
     sample_df: pd.DataFrame,
     mock_backend: MagicMock,
 ) -> None:
-    """Second run_fit fails when another job is already active."""
-    # Claim active slot manually
-    job_store.claim_active("existing_job")
+    """Second fit is refused when another job holds the slot.
 
+    Overturned by P-0119 (worker, thread mode: the core no longer claims the
+    slot; the conflict is an admission refusal, 409 at the API). Before
+    P-0119 the core's claim failed and wrote ``failed`` itself; now the
+    admission refuses with reason ``slot`` before any worker exists, and the
+    refused ``pending`` job is settled ``failed`` with one JOB_CONFLICT
+    frame and one failed metric (the settle's effects).
+    """
+    from lizystudio.services._job_lifecycle_types import AdmissionRefused
+    from lizystudio.services._job_sinks import emit_effects
+
+    job_store.claim_active("blocker-job")
     job = job_store.create(
         backend_name="lizyml",
-        config={"task": "binary"},
+        config={},
         data_ref=sample_data_ref,
         job_type="fit",
     )
-    result = run_fit(
-        job=job,
-        job_store=job_store,
-        backend=mock_backend,
-        config={"task": "binary"},
-        dataframe=sample_df,
-    )
-    assert result.status == "failed"
-    assert "Another job is already running" in (result.error or "")
-
-    job_store.release_active("existing_job")
+    with pytest.raises(AdmissionRefused) as refused:
+        admitted_sink(job_store, job, None)
+    assert refused.value.reason == "slot"
+    stored = job_store.get(job.job_id)
+    assert stored is not None
+    assert stored.status == "failed"
+    assert "Another job is already running" in (stored.error or "")
+    assert job_store.active_job_id == "blocker-job"
+    broadcaster = MagicMock()
+    emit_effects(job_store, broadcaster, refused.value.effects)
+    broadcaster.send_error.assert_called_once()
+    assert broadcaster.send_error.call_args.kwargs.get("code") == "JOB_CONFLICT"
+    job_store.release_active("blocker-job")
 
 
 def test_concurrent_tune_blocked(
@@ -633,26 +661,38 @@ def test_concurrent_tune_blocked(
     sample_df: pd.DataFrame,
     mock_backend: MagicMock,
 ) -> None:
-    """Second run_tune fails when another job is already active."""
-    job_store.claim_active("existing_job")
+    """Second tune is refused when another job holds the slot.
 
+    Overturned by P-0119 (worker, thread mode: the core no longer claims the
+    slot; the conflict is an admission refusal, 409 at the API). Before
+    P-0119 the core's claim failed and wrote ``failed`` itself; now the
+    admission refuses with reason ``slot`` before any worker exists, and the
+    refused ``pending`` job is settled ``failed`` with one JOB_CONFLICT
+    frame and one failed metric (the settle's effects).
+    """
+    from lizystudio.services._job_lifecycle_types import AdmissionRefused
+    from lizystudio.services._job_sinks import emit_effects
+
+    job_store.claim_active("blocker-job")
     job = job_store.create(
         backend_name="lizyml",
-        config={"task": "binary"},
+        config={},
         data_ref=sample_data_ref,
         job_type="tune",
     )
-    result = run_tune(
-        job=job,
-        job_store=job_store,
-        backend=mock_backend,
-        config={"task": "binary"},
-        dataframe=sample_df,
-    )
-    assert result.status == "failed"
-    assert "Another job is already running" in (result.error or "")
-
-    job_store.release_active("existing_job")
+    with pytest.raises(AdmissionRefused) as refused:
+        admitted_sink(job_store, job, None)
+    assert refused.value.reason == "slot"
+    stored = job_store.get(job.job_id)
+    assert stored is not None
+    assert stored.status == "failed"
+    assert "Another job is already running" in (stored.error or "")
+    assert job_store.active_job_id == "blocker-job"
+    broadcaster = MagicMock()
+    emit_effects(job_store, broadcaster, refused.value.effects)
+    broadcaster.send_error.assert_called_once()
+    assert broadcaster.send_error.call_args.kwargs.get("code") == "JOB_CONFLICT"
+    job_store.release_active("blocker-job")
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +802,7 @@ def test_run_tune_forwards_re_tune_to_backend(
         backend=mock_backend,
         config=config,
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
     mock_backend.tune.assert_called_once()
     call_kwargs = mock_backend.tune.call_args.kwargs
@@ -794,6 +835,7 @@ def test_run_tune_without_re_tune_passes_none(
         backend=mock_backend,
         config=config,
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
     mock_backend.tune.assert_called_once()
     assert mock_backend.tune.call_args.kwargs["re_tune"] is None
@@ -901,6 +943,7 @@ def test_run_job_core_cancelled_sets_status(
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert finished.status == "cancelled"
@@ -937,6 +980,7 @@ def test_run_job_core_cancelled_notifies_broadcaster(
         job_store=job_store,
         broadcaster=mock_broadcaster,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, mock_broadcaster),
     )
 
     mock_broadcaster.send_error.assert_called_once()
@@ -971,6 +1015,7 @@ def test_run_job_core_failed_notifies_broadcaster(
         job_store=job_store,
         broadcaster=mock_broadcaster,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, mock_broadcaster),
     )
 
     assert finished.status == "failed"
@@ -1007,6 +1052,7 @@ def test_run_job_core_success_notifies_broadcaster(
         job_store=job_store,
         broadcaster=mock_broadcaster,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, mock_broadcaster),
     )
 
     mock_broadcaster.send_completed.assert_called_once_with(job.job_id)
@@ -1041,6 +1087,7 @@ def test_run_job_core_writes_log_file_on_success(
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, None),
     )
 
     log_path = job_store.jobs_dir / job.job_id / "execution.log"
@@ -1070,6 +1117,7 @@ def test_run_job_core_writes_log_file_on_failure(
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, None),
     )
 
     log_path = job_store.jobs_dir / job.job_id / "execution.log"
@@ -1099,6 +1147,7 @@ def test_run_job_core_writes_log_file_on_cancel(
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_fn,
+        sink=admitted_sink(job_store, job, None),
     )
 
     log_path = job_store.jobs_dir / job.job_id / "execution.log"
@@ -1143,6 +1192,7 @@ def test_start_fit_async_returns_job_id(
         config={"task": "binary"},
         dataframe=sample_df,
         job=job,
+        reset_gen=reserve_for_launch(job_store, job),
     )
 
     assert returned_id == job.job_id
@@ -1176,6 +1226,7 @@ def test_start_fit_async_updates_workspace_on_completion(
         config={"task": "binary"},
         dataframe=sample_df,
         job=job,
+        reset_gen=reserve_for_launch(job_store, job),
     )
 
     # Wait for the background thread to complete (up to 5 seconds)
@@ -1217,6 +1268,7 @@ def test_start_fit_async_job_completed_in_store(
         config={},
         dataframe=sample_df,
         job=job,
+        reset_gen=reserve_for_launch(job_store, job),
     )
 
     deadline = time.monotonic() + 5.0
@@ -1261,6 +1313,7 @@ def test_start_tune_async_returns_job_id(
         config={"task": "binary"},
         dataframe=sample_df,
         job=job,
+        reset_gen=reserve_for_launch(job_store, job),
     )
 
     assert returned_id == job.job_id
@@ -1294,6 +1347,7 @@ def test_start_tune_async_updates_workspace_on_completion(
         config={"task": "binary"},
         dataframe=sample_df,
         job=job,
+        reset_gen=reserve_for_launch(job_store, job),
     )
 
     deadline = time.monotonic() + 5.0
@@ -1334,6 +1388,7 @@ def test_start_tune_async_job_completed_in_store(
         config={},
         dataframe=sample_df,
         job=job,
+        reset_gen=reserve_for_launch(job_store, job),
     )
 
     deadline = time.monotonic() + 5.0
@@ -1381,6 +1436,7 @@ def test_run_fit_cancelled_via_cancel_flag(
         backend=mock_backend,
         config={},
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert result.status == "cancelled"
@@ -1416,6 +1472,7 @@ def test_run_tune_cancelled_via_cancel_flag(
         backend=mock_backend,
         config={},
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert result.status == "cancelled"
@@ -1467,6 +1524,7 @@ def test_run_tune_multi_round_cancelled_between_rounds(
         backend=mock_backend,
         config={"tuning": {"re_tune": {"n_rounds": 3}}},
         dataframe=sample_df,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert result.status == "cancelled"
@@ -1511,32 +1569,37 @@ def test_run_job_core_fails_when_active_slot_taken(
     job_store: JobStore,
     sample_data_ref: DataRef,
 ) -> None:
-    """_run_job_core should fail the job if claim_active returns False."""
+    """A job whose slot is taken is refused at admission and settled failed.
 
-    from lizystudio.services.training import _run_job_core
+    Overturned by P-0119 (worker, thread mode: the core no longer claims the
+    slot; the conflict is an admission refusal, 409 at the API). Before
+    P-0119 the core's claim failed and wrote ``failed`` itself; now the
+    admission refuses with reason ``slot`` before any worker exists, and the
+    refused ``pending`` job is settled ``failed`` with one JOB_CONFLICT
+    frame and one failed metric (the settle's effects).
+    """
+    from lizystudio.services._job_lifecycle_types import AdmissionRefused
+    from lizystudio.services._job_sinks import emit_effects
 
     job_store.claim_active("blocker-job")
-
     job = job_store.create(
         backend_name="lizyml",
         config={},
         data_ref=sample_data_ref,
         job_type="fit",
     )
-
-    def never_called(cb: Any) -> tuple[FitSummary, None, str]:
-        raise AssertionError("Should not be called")
-
-    result = _run_job_core(
-        job=job,
-        job_store=job_store,
-        broadcaster=None,
-        execute_fn=never_called,
-    )
-
-    assert result.status == "failed"
-    assert "already running" in (result.error or "")
+    with pytest.raises(AdmissionRefused) as refused:
+        admitted_sink(job_store, job, None)
+    assert refused.value.reason == "slot"
+    stored = job_store.get(job.job_id)
+    assert stored is not None
+    assert stored.status == "failed"
+    assert "Another job is already running" in (stored.error or "")
     assert job_store.active_job_id == "blocker-job"
+    broadcaster = MagicMock()
+    emit_effects(job_store, broadcaster, refused.value.effects)
+    broadcaster.send_error.assert_called_once()
+    assert broadcaster.send_error.call_args.kwargs.get("code") == "JOB_CONFLICT"
     job_store.release_active("blocker-job")
 
 
@@ -1544,35 +1607,37 @@ def test_run_job_core_job_conflict_notifies_broadcaster(
     job_store: JobStore,
     sample_data_ref: DataRef,
 ) -> None:
-    """_run_job_core: send_error with JOB_CONFLICT when slot taken."""
+    """The refused job's settle carries one JOB_CONFLICT frame.
 
-    from lizystudio.services.training import _run_job_core
-    from lizystudio.ws.progress import ProgressBroadcaster
+    Overturned by P-0119 (worker, thread mode: the core no longer claims the
+    slot; the conflict is an admission refusal, 409 at the API). Before
+    P-0119 the core's claim failed and wrote ``failed`` itself; now the
+    admission refuses with reason ``slot`` before any worker exists, and the
+    refused ``pending`` job is settled ``failed`` with one JOB_CONFLICT
+    frame and one failed metric (the settle's effects).
+    """
+    from lizystudio.services._job_lifecycle_types import AdmissionRefused
+    from lizystudio.services._job_sinks import emit_effects
 
-    mock_broadcaster = MagicMock(spec=ProgressBroadcaster)
     job_store.claim_active("blocker-job")
-
     job = job_store.create(
         backend_name="lizyml",
         config={},
         data_ref=sample_data_ref,
         job_type="fit",
     )
-
-    def never_called(cb: Any) -> tuple[FitSummary, None, str]:
-        raise AssertionError("Should not be called")
-
-    result = _run_job_core(
-        job=job,
-        job_store=job_store,
-        broadcaster=mock_broadcaster,
-        execute_fn=never_called,
-    )
-
-    assert result.status == "failed"
-    mock_broadcaster.send_error.assert_called_once()
-    call_args = mock_broadcaster.send_error.call_args
-    assert call_args.kwargs.get("code") == "JOB_CONFLICT"
+    with pytest.raises(AdmissionRefused) as refused:
+        admitted_sink(job_store, job, None)
+    assert refused.value.reason == "slot"
+    stored = job_store.get(job.job_id)
+    assert stored is not None
+    assert stored.status == "failed"
+    assert "Another job is already running" in (stored.error or "")
+    assert job_store.active_job_id == "blocker-job"
+    broadcaster = MagicMock()
+    emit_effects(job_store, broadcaster, refused.value.effects)
+    broadcaster.send_error.assert_called_once()
+    assert broadcaster.send_error.call_args.kwargs.get("code") == "JOB_CONFLICT"
     job_store.release_active("blocker-job")
 
 
@@ -1602,7 +1667,14 @@ def test_run_subprocess_job_no_data_ref_sets_failed_status(
         job_type="fit",
     )
 
-    _run_subprocess_job(ws, job, job_store, mock_broadcaster, epoch=ws.current_epoch())
+    _run_subprocess_job(
+        ws,
+        job,
+        job_store,
+        mock_broadcaster,
+        token=admit_running(job_store, job),
+        epoch=ws.current_epoch(),
+    )
 
     assert job.status == "failed"
     assert "No data loaded" in (job.error or "")
@@ -1665,6 +1737,7 @@ def test_start_fit_async_subprocess_path(
         config={},
         dataframe=sample_df,
         job=job,
+        reset_gen=reserve_for_launch(job_store, job),
     )
 
     if ws._job_thread:
@@ -1723,6 +1796,7 @@ def test_start_tune_async_subprocess_path(
         config={},
         dataframe=sample_df,
         job=job,
+        reset_gen=reserve_for_launch(job_store, job),
     )
 
     if ws._job_thread:
@@ -1777,7 +1851,14 @@ def test_run_subprocess_job_success_updates_workspace(
         lambda **_kwargs: finished_job,
     )
 
-    _run_subprocess_job(ws, job, job_store, mock_broadcaster, epoch=ws.current_epoch())
+    _run_subprocess_job(
+        ws,
+        job,
+        job_store,
+        mock_broadcaster,
+        token=admit_running(job_store, job),
+        epoch=ws.current_epoch(),
+    )
 
     assert ws.workspace_fit_result is fit_result
     assert ws.workspace_tune_result is None
@@ -1969,7 +2050,7 @@ def _make_tune_parent_with_checkpoint(
         job_type="tune",
     )
     parent.status = "completed"
-    job_store.update(parent)
+    seed_job(job_store, parent)
     # Drop a fake checkpoint next to the meta.
     parent_dir = job_store.jobs_dir / parent.job_id
     (parent_dir / "model.pkl").write_bytes(b"fake")
@@ -2010,6 +2091,7 @@ def test_run_retune_copies_checkpoint_and_returns_completed_job(
         expand_boundary=True,
         boundary_threshold=0.05,
         broadcaster=None,
+        sink=admitted_sink(job_store, child, None),
     )
 
     assert result.status == "completed"
@@ -2071,6 +2153,7 @@ def test_run_retune_marks_child_failed_when_load_checkpoint_raises(
         expand_boundary=None,
         boundary_threshold=None,
         broadcaster=None,
+        sink=admitted_sink(job_store, child, None),
     )
 
     assert result.status == "failed"
@@ -2114,6 +2197,7 @@ def test_start_retune_async_fails_fast_when_ws_dataframe_none(
         expand_boundary=None,
         boundary_threshold=None,
         mode="retune",
+        reset_gen=reserve_for_launch(job_store, child),
     )
 
     assert returned_id == child.job_id
@@ -2166,6 +2250,7 @@ def test_start_retune_async_spawns_thread_and_updates_workspace(
         expand_boundary=None,
         boundary_threshold=None,
         mode="retune",
+        reset_gen=reserve_for_launch(job_store, child),
     )
     assert returned_id == child.job_id
 
@@ -2225,6 +2310,7 @@ def test_start_retune_async_releases_lock_even_on_run_retune_error(
         expand_boundary=None,
         boundary_threshold=None,
         mode="retune",
+        reset_gen=reserve_for_launch(job_store, child),
     )
     thread = ws._job_thread
     assert thread is not None
@@ -2287,6 +2373,7 @@ def test_start_retune_async_subprocess_path_when_openmp_present(
         expand_boundary: Any,
         boundary_threshold: Any,
         epoch: int,
+        token: Any,  # P-0119: the admitted run token
     ) -> Any:
         called["invoked"] = True
         called["parent_id"] = parent_job.job_id
@@ -2296,7 +2383,7 @@ def test_start_retune_async_subprocess_path_when_openmp_present(
         child_job.status = "completed"
         child_job.fit_result = None
         child_job.tune_result = None
-        job_store.update(child_job)
+        seed_job(job_store, child_job)
         with ws._lock:
             ws.current_job_id = child_job.job_id
         return child_job
@@ -2318,6 +2405,7 @@ def test_start_retune_async_subprocess_path_when_openmp_present(
         expand_boundary=None,
         boundary_threshold=None,
         mode="retune",
+        reset_gen=reserve_for_launch(job_store, child),
     )
 
     thread = ws._job_thread
@@ -2390,6 +2478,7 @@ def test_start_retune_async_rejects_in_memory_dataset_in_subprocess_mode(
         expand_boundary=None,
         boundary_threshold=None,
         mode="retune",
+        reset_gen=reserve_for_launch(job_store, child),
     )
 
     assert returned == child.job_id
@@ -2412,7 +2501,8 @@ def test_run_retune_subprocess_helper_fails_child_on_missing_data_ref_path(
     """Direct unit test for _run_retune_subprocess: when the caller
     violates the contract by passing a ws with a missing data_ref.path,
     the helper must mark the child as ``failed`` via the shared
-    ``_mark_retune_child_failed`` helper instead of raising
+    abort of the admitted run (P-0119; formerly ``_mark_retune_child_failed``)
+    instead of raising
     AssertionError. H-0062 Bugfix 2026-04-14 (6): the old ``assert``
     left the child in ``pending`` forever inside the worker thread."""
     from lizystudio.services.training import _run_retune_subprocess
@@ -2447,6 +2537,7 @@ def test_run_retune_subprocess_helper_fails_child_on_missing_data_ref_path(
         expand_boundary=None,
         boundary_threshold=None,
         epoch=ws.current_epoch(),
+        token=admit_running(job_store, child),
     )
 
     # Returned job reflects the failed state (same instance mutated).
@@ -2511,6 +2602,7 @@ def test_start_retune_async_worker_crash_transitions_child_to_failed(
         expand_boundary=None,
         boundary_threshold=None,
         mode="retune",
+        reset_gen=reserve_for_launch(job_store, child),
     )
     thread = ws._job_thread
     assert thread is not None

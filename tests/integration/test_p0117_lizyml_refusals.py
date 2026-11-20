@@ -43,6 +43,7 @@ from lizystudio.services.data import load_dataframe
 from lizystudio.services.jobs import Job, JobStore
 from lizystudio.services.subprocess_runner import run_job_in_subprocess
 from lizystudio.services.training import run_fit
+from tests.lifecycle_seed import admit_running, admitted_sink
 
 pytestmark = pytest.mark.integration
 
@@ -115,6 +116,7 @@ def _fit(
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(data),
+            token=admit_running(store, job),
         )
     return run_fit(
         job=job,
@@ -123,6 +125,7 @@ def _fit(
         config=config,
         dataframe=load_dataframe(str(data)),
         broadcaster=broadcaster,
+        sink=admitted_sink(store, job, broadcaster),
     )
 
 
