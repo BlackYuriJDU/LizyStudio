@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from lizystudio.backends.types import DataRef, TuningSummary
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.integration
 
@@ -71,7 +72,7 @@ def _make_completed_tune_job(client: TestClient, data_ref: DataRef) -> str:
         metric_name="auc",
         direction="maximize",
     )
-    job_store.update(job)
+    seed_job(job_store, job)
     job_dir = job_store.jobs_dir / job.job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "model.pkl").write_bytes(b"fake pickle payload")
@@ -291,7 +292,7 @@ def test_resume_rebind_race_deletes_child_and_returns_409(
         metric_name="auc",
         direction="maximize",
     )
-    job_store.update(job)
+    seed_job(job_store, job)
     job_dir = job_store.jobs_dir / job.job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "model.pkl").write_bytes(b"fake")

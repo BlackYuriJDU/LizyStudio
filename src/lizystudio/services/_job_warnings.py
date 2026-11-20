@@ -107,6 +107,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, TextIO
 
 if TYPE_CHECKING:
+    from lizystudio.services._job_lifecycle_types import RunToken
     from lizystudio.services.jobs import Job, JobStore
     from lizystudio.ws.progress import ProgressBroadcaster
 
@@ -181,7 +182,11 @@ class JobWarningCollector:
         job_store: JobStore,
         broadcaster: ProgressBroadcaster | None,
         job_logger: logging.Logger,
+        token: RunToken | None = None,
     ) -> None:
+        # P-0119: with a run token, a warning stored after the run was
+        # revoked (force-release) is dropped and logged, not persisted.
+        self._token = token
         self._job = job
         self._job_store = job_store
         self._broadcaster = broadcaster
@@ -223,11 +228,14 @@ class JobWarningCollector:
         self._seen.add(text)
         self._job.warnings = [*self._job.warnings, text]
         try:
-            self._job_store.update(self._job)
+            stored = self._job_store.write_results(self._job, self._token)
         except OSError:
+            stored = True
             _logger.warning(
                 "Failed to persist job warnings for %s", self._job.job_id, exc_info=True
             )
+        if not stored:
+            return
         if self._broadcaster is not None:
             self._broadcaster.send_warning(self._job.job_id, text)
 

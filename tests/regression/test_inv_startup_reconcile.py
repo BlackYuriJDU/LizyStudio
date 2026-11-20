@@ -17,8 +17,11 @@ records may carry mid-flight state from the previous process:
 
 This module pins the startup reconciliation contract:
 
-  INV-restart-1: every ``running`` record on disk transitions to
-                 ``failed`` with a clear error message at startup.
+  INV-restart-1: every CANCEL-less ``running`` / ``pending`` record on
+                 disk transitions to ``failed`` with a clear error message
+                 at startup. P-0119 (Q6): a record whose cancel was
+                 accepted (CANCEL file) becomes ``cancelled`` instead —
+                 pinned in ``test_reg_0613_restart_and_fence.py``.
 
   INV-restart-2: at most ONE ``paused`` job survives startup (newest
                  by ``created_at`` wins); the survivor claims the
@@ -39,6 +42,7 @@ import pytest
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -80,7 +84,7 @@ def _create_with_status(
         job_type=job_type,
     )
     job.status = status  # type: ignore[assignment]
-    store.update(job)
+    seed_job(store, job)
     return job
 
 

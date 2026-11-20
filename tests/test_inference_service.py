@@ -233,6 +233,7 @@ from lizystudio.services.inference import (  # noqa: E402
     run_inference,
 )
 from lizystudio.services.jobs import JobStore  # noqa: E402
+from tests.lifecycle_seed import seed_job  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -379,7 +380,7 @@ def test_compute_metrics_with_job_nested_raw(tmp_path: Path) -> None:
         fold_count=5,
         params=[],
     )
-    job_store.update(job)
+    seed_job(job_store, job)
 
     pred_df = pd.DataFrame({"pred": [0, 1], "proba": [0.1, 0.9], "actual": [0, 1]})
     result = _compute_inference_metrics(pred_df, {"task": "binary"}, job=job)
@@ -411,7 +412,7 @@ def test_compute_metrics_with_job_flat_metrics(tmp_path: Path) -> None:
         fold_count=3,
         params=[],
     )
-    job_store.update(job)
+    seed_job(job_store, job)
 
     pred_df = pd.DataFrame({"pred": [0, 1], "actual": [0, 1]})
     result = _compute_inference_metrics(pred_df, {"task": "binary"}, job=job)
@@ -446,7 +447,7 @@ def test_run_inference_success(tmp_path: Path) -> None:
     job.status = "completed"
     job.model_path = str(tmp_path / "model")
     job.fit_result = FitSummary(metrics={"auc": 0.9}, fold_count=5, params=[])
-    job_store.update(job)
+    seed_job(job_store, job)
 
     fake_pred = MagicMock()
     fake_pred.predictions = pd.DataFrame({"pred": [0, 1, 0], "proba": [0.1, 0.9, 0.2]})
@@ -495,7 +496,7 @@ def test_run_inference_detects_ground_truth(tmp_path: Path) -> None:
     job.status = "completed"
     job.model_path = str(tmp_path / "model")
     job.fit_result = FitSummary(metrics={"auc": 0.9}, fold_count=5, params=[])
-    job_store.update(job)
+    seed_job(job_store, job)
 
     fake_pred = MagicMock()
     fake_pred.predictions = pd.DataFrame({"pred": [0, 1], "proba": [0.1, 0.9]})
@@ -566,7 +567,7 @@ def test_get_inference_plot_success(tmp_path: Path) -> None:
     )
     job.status = "completed"
     job.model_path = str(tmp_path / "model")
-    job_store.update(job)
+    seed_job(job_store, job)
 
     fake_plot = MagicMock()
     fake_plot.plotly_json = '{"data":[]}'

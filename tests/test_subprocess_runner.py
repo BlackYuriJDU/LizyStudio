@@ -24,6 +24,7 @@ from lizystudio.services.subprocess_runner import (
     _forward_progress,
     run_job_in_subprocess,
 )
+from tests.lifecycle_seed import admit_running
 
 pytestmark = pytest.mark.unit
 
@@ -139,6 +140,7 @@ class TestRunJobInSubprocess:
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(sample_csv),
+            token=admit_running(job_store, job),
         )
         assert result_job.status == "completed"
         assert result_job.fit_result is not None
@@ -165,6 +167,7 @@ class TestRunJobInSubprocess:
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(sample_csv),
+            token=admit_running(job_store, job),
         )
         assert result_job.status == "completed"
         assert result_job.fit_result is not None
@@ -191,6 +194,7 @@ class TestRunJobInSubprocess:
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(sample_csv),
+            token=admit_running(job_store, job),
         )
         # At minimum, send_completed should have been called
         assert broadcaster.send_completed.called or broadcaster.send_error.called
@@ -216,6 +220,7 @@ class TestRunJobInSubprocess:
             broadcaster=broadcaster,
             backend_name="lizyml",
             data_path=str(sample_csv),
+            token=admit_running(job_store, job),
         )
         assert result_job.status == "failed"
         assert result_job.error is not None
@@ -365,6 +370,7 @@ class TestRetuneArgValidation:
                 mode="retune",
                 parent_job_id=None,
                 retune_n_trials=5,
+                token=admit_running(job_store, job),
             )
 
     def test_retune_with_zero_n_trials_raises(
@@ -388,6 +394,7 @@ class TestRetuneArgValidation:
                 mode="retune",
                 parent_job_id="parent-xyz",
                 retune_n_trials=0,
+                token=admit_running(job_store, job),
             )
 
     def test_retune_with_negative_n_trials_raises(
@@ -411,6 +418,7 @@ class TestRetuneArgValidation:
                 mode="retune",
                 parent_job_id="parent-xyz",
                 retune_n_trials=-1,
+                token=admit_running(job_store, job),
             )
 
     def test_retune_valid_args_populate_args_file(
@@ -473,6 +481,7 @@ class TestRetuneArgValidation:
             retune_n_trials=7,
             retune_expand_boundary=False,
             retune_boundary_threshold=0.25,
+            token=admit_running(job_store, job),
         )
 
         assert captured["args"]["parent_job_id"] == "parent-abc"
@@ -565,6 +574,7 @@ class TestSubprocessTimeoutAndErrors:
             broadcaster=None,
             backend_name="lizyml",
             data_path="/nonexistent.csv",
+            token=admit_running(job_store, job),
         )
 
         # kill() must have been called because first wait() timed out.
@@ -618,6 +628,7 @@ class TestSubprocessTimeoutAndErrors:
                 return None
             return original_get(job_id)
 
+        token = admit_running(job_store, job)
         monkeypatch.setattr(job_store, "get", _fake_get)
 
         result_job = run_job_in_subprocess(
@@ -626,6 +637,7 @@ class TestSubprocessTimeoutAndErrors:
             broadcaster=None,
             backend_name="lizyml",
             data_path="/nonexistent.csv",
+            token=token,
         )
 
         assert result_job.status == "failed"

@@ -34,6 +34,7 @@ import pytest
 from lizystudio.backends.base import BackendAdapter
 from lizystudio.backends.lizyml import LizyMLAdapter
 from lizystudio.backends.types import FitSummary, TuningSummary
+from tests.lifecycle_seed import admitted_sink, seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -263,6 +264,7 @@ def test_run_tune_passes_storage_kwargs_to_backend(tmp_path: Path) -> None:
         config=config,
         dataframe=MagicMock(),
         broadcaster=None,
+        sink=admitted_sink(job_store, job, None),
     )
 
     backend.tune.assert_called_once()
@@ -317,7 +319,7 @@ def test_run_retune_does_not_pass_storage_kwargs_yet(
     )
     assert parent is not None
     parent.status = "completed"
-    job_store.update(parent)
+    seed_job(job_store, parent)
     job_store.release_active(parent.job_id)
     parent_dir = job_store.job_dir(parent.job_id)
     (parent_dir / "model.pkl").write_bytes(b"stub")
@@ -368,6 +370,7 @@ def test_run_retune_does_not_pass_storage_kwargs_yet(
         expand_boundary=None,
         boundary_threshold=None,
         broadcaster=None,
+        sink=admitted_sink(job_store, child, None),
     )
 
     backend.tune.assert_called()

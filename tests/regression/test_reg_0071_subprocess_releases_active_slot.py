@@ -23,6 +23,7 @@ import pytest
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import admit_running, fake_child_exit, seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -74,18 +75,17 @@ def test_subprocess_job_releases_slot_on_success(
     job = _make_claimed_job(job_store)
     assert job_store.active_job_id == job.job_id
 
-    def _fake_run_subprocess(**kwargs):  # type: ignore[no-untyped-def]
-        finished = kwargs["job"]
-        finished.status = "completed"
-        return finished
-
-    monkeypatch.setattr(
-        "lizystudio.services.subprocess_runner.run_job_in_subprocess",
-        _fake_run_subprocess,
-    )
+    # P-0119: the child persists ``completed`` and exits 0; the parent adopts
+    # it with one commit of the run token, which releases the slot.
+    fake_child_exit(monkeypatch, status="completed", returncode=0)
 
     training_module._run_subprocess_job(
-        ws, job, job_store, broadcaster=MagicMock(), epoch=ws.current_epoch()
+        ws,
+        job,
+        job_store,
+        broadcaster=MagicMock(),
+        token=admit_running(job_store, job),
+        epoch=ws.current_epoch(),
     )
 
     assert job_store.active_job_id is None, (
@@ -109,14 +109,36 @@ def test_subprocess_job_releases_slot_on_exception(
         _boom,
     )
 
-    with pytest.raises(RuntimeError, match="simulated"):
+    token = admit_running(job_store, job)
+    with pytest.raises(RuntimeError, match="simulated") as raised:
         training_module._run_subprocess_job(
-            ws, job, job_store, broadcaster=MagicMock(), epoch=ws.current_epoch()
+            ws,
+            job,
+            job_store,
+            broadcaster=MagicMock(),
+            token=token,
+            epoch=ws.current_epoch(),
         )
+    # P-0119 (#765 の片割れ): ``_run_subprocess_job`` has no ``finally``
+    # release any more; the launcher's guard settles the run through its
+    # token, exactly as ``start_*_async`` does when the exception escapes.
+    assert job_store.active_job_id == job.job_id
+    training_module._fail_escaped_job(
+        ws=ws,
+        job=job,
+        job_store=job_store,
+        broadcaster=MagicMock(),
+        exc=raised.value,
+        epoch=ws.current_epoch(),
+        token=token,
+    )
 
     assert job_store.active_job_id is None, (
         "subprocess failure path must still release the slot"
     )
+    stored = job_store.get(job.job_id)
+    assert stored is not None
+    assert stored.status == "failed"
 
 
 def test_subprocess_job_releases_slot_when_data_ref_missing(
@@ -129,7 +151,12 @@ def test_subprocess_job_releases_slot_when_data_ref_missing(
     job = _make_claimed_job(job_store)
 
     training_module._run_subprocess_job(
-        ws, job, job_store, broadcaster=MagicMock(), epoch=ws.current_epoch()
+        ws,
+        job,
+        job_store,
+        broadcaster=MagicMock(),
+        token=admit_running(job_store, job),
+        epoch=ws.current_epoch(),
     )
 
     assert job_store.active_job_id is None
@@ -149,7 +176,7 @@ def test_create_and_claim_active_reclaims_stale_slot(job_store: JobStore) -> Non
     # Simulate the runner thread crashing before release: mark the
     # job completed on disk but do not call release_active.
     first.status = "completed"
-    job_store.update(first)
+    seed_job(job_store, first)
     assert job_store.active_job_id == first.job_id
 
     second = job_store.create_and_claim_active(
@@ -175,7 +202,7 @@ def test_create_and_claim_active_refuses_when_holder_is_running(
     """A genuinely running holder still blocks the new caller."""
     first = _make_claimed_job(job_store)
     first.status = "running"
-    job_store.update(first)
+    seed_job(job_store, first)
 
     second = job_store.create_and_claim_active(
         backend_name="lizyml",

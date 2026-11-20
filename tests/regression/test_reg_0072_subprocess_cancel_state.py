@@ -22,6 +22,7 @@ import pytest
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import admit_running, seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -40,7 +41,7 @@ def _make_running_job(store: JobStore) -> str:
         job_type="fit",
     )
     job.status = "running"
-    store.update(job)
+    seed_job(store, job)
     return job.job_id
 
 
@@ -98,6 +99,7 @@ def test_cancel_transitions_running_job_to_cancelled(
         broadcaster=None,
         backend_name="lizyml",
         data_path="/data/x.csv",
+        token=admit_running(job_store, job),
     )
 
     assert result.status == "cancelled", (
@@ -128,6 +130,7 @@ def test_unexpected_exit_transitions_running_job_to_failed(
         broadcaster=None,
         backend_name="lizyml",
         data_path="/data/x.csv",
+        token=admit_running(job_store, job),
     )
 
     assert result.status == "failed"
@@ -141,17 +144,24 @@ def test_unexpected_exit_transitions_running_job_to_failed(
 def test_successful_exit_does_not_rewrite_state(
     job_store: JobStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When the subprocess already wrote a terminal state, keep it."""
+    """When the subprocess already wrote a terminal state, keep it.
+
+    P-0119 (PR-A, ``LegacyChildStatusSink``): the parent adopts the child's
+    terminal with one commit of the run token admitted before the child ran.
+    """
     from lizystudio.services import subprocess_runner as sr
 
     job_id = _make_running_job(job_store)
     job = job_store.get(job_id)
     assert job is not None
 
+    # P-0119: the run is admitted first (admission writes ``running``); the
+    # legacy child then writes its terminal state, which the parent adopts.
+    token = admit_running(job_store, job)
     # Simulate a successful run by writing the terminal state ourselves.
     job.status = "completed"
     job.model_path = "/tmp/fake"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     _patch_subprocess(monkeypatch, returncode=0)
 
@@ -161,6 +171,7 @@ def test_successful_exit_does_not_rewrite_state(
         broadcaster=None,
         backend_name="lizyml",
         data_path="/data/x.csv",
+        token=token,
     )
 
     assert result.status == "completed"

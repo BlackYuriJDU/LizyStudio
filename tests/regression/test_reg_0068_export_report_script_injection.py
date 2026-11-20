@@ -20,6 +20,7 @@ import pytest
 from lizystudio.backends.types import DataRef, FitSummary, PlotData
 from lizystudio.services.export import export_report
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -40,7 +41,7 @@ def _make_job(job_store: JobStore) -> str:
     job.status = "completed"
     job.fit_result = FitSummary(metrics={}, fold_count=5, params=[])
     job.model_path = "/fake/model"
-    job_store.update(job)
+    seed_job(job_store, job)
     return job.job_id
 
 

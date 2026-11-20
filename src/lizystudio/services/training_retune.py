@@ -9,27 +9,31 @@ Public entry points:
 - ``start_retune_async`` -- background launcher used by the API layer.
 
 Internal helpers (``_copy_checkpoint_to_child``,
-``_mark_retune_child_failed``, ``_run_retune_subprocess``) are kept as
+``_retune_worker``, ``_run_retune_subprocess``) are kept as
 module-private functions and are not part of the public surface.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
-from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from lizystudio.backends.base import BackendAdapter, ProgressCallback
 from lizystudio.backends.types import FitSummary, TuningSummary
+from lizystudio.services._job_lifecycle_types import AdmissionRefused, RunToken
+from lizystudio.services._job_sinks import OutcomeSink, ParentCommitSink, emit_effects
 from lizystudio.services._training_core import (
+    _fail_escaped_job,
     _join_previous_thread,
     _prepare_autofit_config,
     _run_job_core,
     _run_pickle_preflight,
     _run_subprocess_job,
     _save_tuning_plot,
+    record_outcome,
+    start_worker,
 )
 from lizystudio.services.jobs import Job, JobStore
 
@@ -62,8 +66,9 @@ def run_retune(
     expand_boundary: bool | None,
     boundary_threshold: float | None,
     broadcaster: ProgressBroadcaster | None = None,
+    sink: OutcomeSink,
 ) -> Job:
-    """Execute a Re-tune / Resume child job (H-0062).
+    """Execute a Re-tune / Resume child job (H-0062); outcome to *sink*.
 
     Copies the parent's ``model.pkl`` into the child's job directory,
     loads it via the adapter's ``load_checkpoint``, then calls
@@ -118,36 +123,8 @@ def run_retune(
         job_store=job_store,
         broadcaster=broadcaster,
         execute_fn=execute,
+        sink=sink,
     )
-
-
-def _mark_retune_child_failed(
-    *,
-    ws: WorkspaceState,
-    job_store: JobStore,
-    broadcaster: ProgressBroadcaster | None,
-    child_job: Job,
-    message: str,
-    epoch: int,
-) -> None:
-    """Mark *child_job* as failed and wire the workspace to surface it.
-
-    Shared between the pre-spawn guards in ``start_retune_async`` and
-    the worker-thread guard in ``_run_retune_subprocess``. H-0062
-    Bugfix 2026-04-14 (6): previously the subprocess helper used
-    ``assert``, which raised ``AssertionError`` inside the worker
-    thread and left the child in ``pending`` forever (no status
-    transition, no broadcaster error). Using a shared helper ensures
-    both failure paths go through the same state transitions.
-    """
-    child_job.status = "failed"
-    child_job.error = message
-    child_job.completed_at = datetime.now(timezone.utc).isoformat()
-    job_store.update(child_job)
-    ws.note_current_job(child_job.job_id, epoch=epoch)
-    if broadcaster is not None:
-        broadcaster.send_error(child_job.job_id, message)
-    job_store.record_job_terminal(child_job.job_type, "failed")
 
 
 def _run_retune_subprocess(
@@ -161,41 +138,45 @@ def _run_retune_subprocess(
     expand_boundary: bool | None,
     boundary_threshold: float | None,
     epoch: int,
+    token: RunToken,
 ) -> Job:
     """Execute a Re-tune child job in a subprocess (H-0062).
 
     Delegates to the shared ``_run_subprocess_job`` orchestrator
-    (Issue #118) so subprocess lifecycle management (data-ref check,
-    ``run_job_in_subprocess`` call, workspace state update, and
-    active-slot release) is not duplicated.
+    (Issue #118); a missing file-backed dataset aborts the admission there.
     """
-
-    def _on_data_missing(_job: Job) -> None:
-        _mark_retune_child_failed(
-            ws=ws,
-            job_store=job_store,
-            broadcaster=broadcaster,
-            child_job=child_job,
-            message=(
-                "subprocess retune requires a file-backed dataset "
-                "(ws.data_ref.path is empty)"
-            ),
-            epoch=epoch,
-        )
-
     return _run_subprocess_job(
         ws,
         child_job,
         job_store,
         broadcaster,
+        token=token,
         mode="retune",
         parent_job_id=parent_job.job_id,
         retune_n_trials=n_trials,
         retune_expand_boundary=expand_boundary,
         retune_boundary_threshold=boundary_threshold,
-        on_data_missing=_on_data_missing,
+        missing_data_error=(
+            "subprocess retune requires a file-backed dataset "
+            "(ws.data_ref.path is empty)"
+        ),
         epoch=epoch,
     )
+
+
+def _retune_inline_error(ws: WorkspaceState, use_subprocess: bool) -> str | None:
+    """Why the retune cannot start with the workspace as it is, or ``None``."""
+    if ws.dataframe is None:
+        return "No data loaded in workspace; cannot re-tune"
+    if use_subprocess and (ws.data_ref is None or not ws.data_ref.path):
+        # Subprocess path reads the dataframe from disk in the child, so an
+        # in-memory-only dataset cannot be re-tuned under OpenMP without
+        # first being saved; the thread path would be ~8x slower.
+        return (
+            "Re-tune requires a file-backed dataset when OpenMP is active; "
+            "please re-upload or save the current data before retrying"
+        )
+    return None
 
 
 def start_retune_async(
@@ -209,127 +190,103 @@ def start_retune_async(
     expand_boundary: bool | None,
     boundary_threshold: float | None,
     mode: Literal["retune", "resume"],
+    reset_gen: int,
 ) -> str:
-    """Spawn a background thread for Re-tune / Resume (H-0062).
+    """Admit the Re-tune / Resume child and spawn its worker (H-0062, P-0119).
 
-    Holds a per-parent lock that was already acquired by the API layer
-    and releases it when the child thread finishes regardless of
-    success / failure. The *mode* string is used in log messages to
-    distinguish the two semantic cases even though they share the
-    same code path.
+    Admission happens here at the launcher entry, before the join: the child
+    claims the slot when it is empty (thread and subprocess mode alike), and
+    a slot held by another job, or a *reset_gen* older than the current one
+    (a reset ran after ``create_child``), refuses it with
+    :class:`AdmissionRefused` and settles the child. The per-parent lock the
+    API acquired is released when the worker ends; on a refusal the API's
+    own ``finally`` releases it.
 
-    When ``should_use_subprocess()`` is True (i.e. OpenMP is present),
-    the actual Re-tune work runs in a child process to avoid the
-    daemon-thread OpenMP thread-pool bind that causes ~8-50× slowdown.
-    Discovered as H-0062 Bugfix 2026-04-14 after the initial implementation
-    was thread-only and observed 1 trial / ~40s instead of ~5s on Titanic.
+    When ``should_use_subprocess()`` is True (OpenMP present), the work runs
+    in a child process to avoid the daemon-thread OpenMP slowdown (H-0062
+    Bugfix 2026-04-14).
     """
     from lizystudio.services.openmp_detect import should_use_subprocess
 
-    # P-0114: capture the reset generation before the join; every workspace
-    # write below (inline failure, worker start, completion, thread
-    # registration) is fenced by it.
+    # P-0114: the workspace reset generation, captured before the join.
     epoch = ws.current_epoch()
-    _join_previous_thread(ws)
-
+    try:
+        token = job_store.admit(
+            child_job.job_id, expect="pending", reset_gen=reset_gen, slot_rule="claim"
+        )
+    except AdmissionRefused as exc:
+        emit_effects(job_store, broadcaster, exc.effects)
+        raise
     use_subprocess = should_use_subprocess()
-
-    def _fail_inline(message: str) -> str:
-        # Early-fail path: delegate state transitions to the shared
-        # helper, then also release the parent lock (which only makes
-        # sense in the inline path -- the async worker thread releases
-        # via its own finally block).
-        _mark_retune_child_failed(
-            ws=ws,
-            job_store=job_store,
-            broadcaster=broadcaster,
-            child_job=child_job,
-            message=message,
-            epoch=epoch,
-        )
+    run = _retune_worker(
+        ws=ws,
+        job_store=job_store,
+        broadcaster=broadcaster,
+        parent_job=parent_job,
+        child_job=child_job,
+        params=(n_trials, expand_boundary, boundary_threshold),
+        mode=mode,
+        epoch=epoch,
+        token=token,
+        use_subprocess=use_subprocess,
+    )
+    started = start_worker(
+        ws=ws,
+        job_store=job_store,
+        broadcaster=broadcaster,
+        token=token,
+        run=run,
+        epoch=epoch,
+        join=lambda w: _join_previous_thread(w),
+        precheck=lambda: _retune_inline_error(ws, use_subprocess),
+    )
+    if not started:
+        # Early-fail path (after the join, as before P-0119): the abort
+        # settled the child; point the workspace at it and free the parent.
+        ws.note_current_job(child_job.job_id, epoch=epoch)
         job_store.release_parent_lock(parent_job.job_id)
-        return child_job.job_id
+    return child_job.job_id
 
-    if ws.dataframe is None:
-        return _fail_inline("No data loaded in workspace; cannot re-tune")
 
-    if use_subprocess and (ws.data_ref is None or not ws.data_ref.path):
-        # Subprocess path reads the dataframe from disk in the child,
-        # so an in-memory-only dataset (data_ref.path empty) cannot be
-        # re-tuned under OpenMP without first being saved. Surface it
-        # explicitly rather than silently downgrading to the thread
-        # path, since the thread path would still be ~8x slower and
-        # the user would blame the retune itself.
-        return _fail_inline(
-            "Re-tune requires a file-backed dataset when OpenMP is active; "
-            "please re-upload or save the current data before retrying"
-        )
-
-    dataframe = ws.dataframe
+def _retune_worker(
+    *,
+    ws: WorkspaceState,
+    job_store: JobStore,
+    broadcaster: ProgressBroadcaster,
+    parent_job: Job,
+    child_job: Job,
+    params: tuple[int, bool | None, float | None],
+    mode: str,
+    epoch: int,
+    token: RunToken,
+    use_subprocess: bool,
+) -> Callable[[], None]:
+    """The retune worker thread body."""
+    n_trials, expand_boundary, boundary_threshold = params
+    retune: dict[str, Any] = {
+        "ws": ws,
+        "job_store": job_store,
+        "broadcaster": broadcaster,
+        "parent_job": parent_job,
+        "child_job": child_job,
+        "n_trials": n_trials,
+        "expand_boundary": expand_boundary,
+        "boundary_threshold": boundary_threshold,
+    }
 
     def _run() -> None:
         # H-0062: always point the workspace at the child so a failed /
-        # cancelled / crashed retune still surfaces through the Workspace
-        # Results Panel instead of leaving the selection on the parent.
+        # cancelled / crashed retune still surfaces in the Results Panel.
         ws.note_current_job(child_job.job_id, epoch=epoch)
         try:
             if use_subprocess:
-                _run_retune_subprocess(
-                    ws=ws,
-                    job_store=job_store,
-                    broadcaster=broadcaster,
-                    parent_job=parent_job,
-                    child_job=child_job,
-                    n_trials=n_trials,
-                    expand_boundary=expand_boundary,
-                    boundary_threshold=boundary_threshold,
-                    epoch=epoch,
-                )
+                _run_retune_subprocess(**retune, epoch=epoch, token=token)
             else:
-                finished = run_retune(
-                    parent_job=parent_job,
-                    child_job=child_job,
-                    job_store=job_store,
-                    backend=ws.backend,
-                    dataframe=dataframe,
-                    n_trials=n_trials,
-                    expand_boundary=expand_boundary,
-                    boundary_threshold=boundary_threshold,
-                    broadcaster=broadcaster,
-                )
-                ws.record_completion(
-                    fit_result=finished.fit_result,
-                    tune_result=finished.tune_result,
-                    job_id=finished.job_id,
-                    epoch=epoch,
-                )
+                _retune_in_thread(retune, epoch=epoch, token=token)
         except Exception as exc:  # noqa: BLE001
-            # H-0062 Bugfix 2026-04-14 (6): any unexpected exception
-            # inside the worker thread must still transition the child
-            # to `failed` and notify the broadcaster. Without this
-            # blanket catch, an assertion error or programming bug
-            # leaves the child `pending` forever.
-            _logger.exception(
-                "event='retune.worker_crash' mode=%s parent=%s child=%s",
-                mode,
-                parent_job.job_id,
-                child_job.job_id,
-            )
-            # Only mark failed if the child has not already been
-            # transitioned (run_retune / _run_job_core may have done so).
-            refreshed = job_store.get(child_job.job_id)
-            if refreshed is None or refreshed.status in ("pending", "running"):
-                _mark_retune_child_failed(
-                    ws=ws,
-                    job_store=job_store,
-                    broadcaster=broadcaster,
-                    child_job=child_job,
-                    message=f"retune worker crashed: {exc}",
-                    epoch=epoch,
-                )
+            _settle_retune_crash(retune, exc, mode=mode, epoch=epoch, token=token)
         finally:
-            # Always release the per-parent lock, even when run_retune
-            # raised (cancellation, pickle mismatch, etc.).
+            # Always release the per-parent lock, even when run_retune raised.
             job_store.release_parent_lock(parent_job.job_id)
             _logger.info(
                 "event='retune.finished' mode=%s parent=%s child=%s",
@@ -338,7 +295,52 @@ def start_retune_async(
                 child_job.job_id,
             )
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    ws.register_job_thread(t, epoch=epoch, job_id=child_job.job_id)
-    return child_job.job_id
+    return _run
+
+
+def _retune_in_thread(retune: dict[str, Any], *, epoch: int, token: RunToken) -> None:
+    """Thread mode: run the retune in this worker and record its outcome."""
+    ws = retune["ws"]
+    job_store = retune["job_store"]
+    broadcaster = retune["broadcaster"]
+    finished = run_retune(
+        parent_job=retune["parent_job"],
+        child_job=retune["child_job"],
+        job_store=job_store,
+        backend=ws.backend,
+        dataframe=ws.dataframe,
+        n_trials=retune["n_trials"],
+        expand_boundary=retune["expand_boundary"],
+        boundary_threshold=retune["boundary_threshold"],
+        broadcaster=broadcaster,
+        sink=ParentCommitSink(job_store, broadcaster, token),
+    )
+    record_outcome(ws, finished, epoch=epoch)
+
+
+def _settle_retune_crash(
+    retune: dict[str, Any],
+    exc: Exception,
+    *,
+    mode: str,
+    epoch: int,
+    token: RunToken,
+) -> None:
+    """H-0062 Bugfix 2026-04-14 (6): an unexpected exception must still settle
+    the child; P-0119: a ``failed`` commit of its token, which is a no-op once
+    the core has committed."""
+    _logger.exception(
+        "event='retune.worker_crash' mode=%s parent=%s child=%s",
+        mode,
+        retune["parent_job"].job_id,
+        retune["child_job"].job_id,
+    )
+    _fail_escaped_job(
+        ws=retune["ws"],
+        job=retune["child_job"],
+        job_store=retune["job_store"],
+        broadcaster=retune["broadcaster"],
+        exc=exc,
+        epoch=epoch,
+        token=token,
+    )

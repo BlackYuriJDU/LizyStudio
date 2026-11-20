@@ -8,6 +8,7 @@ import pytest
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -259,7 +260,7 @@ def test_has_active_children_false_when_all_completed(job_store: JobStore) -> No
         parent_job_id=parent.job_id,
     )
     child.status = "completed"
-    job_store.update(child)
+    seed_job(job_store, child)
     assert job_store.has_active_children(parent.job_id) is False
 
 
@@ -278,7 +279,7 @@ def test_has_active_children_true_when_running(job_store: JobStore) -> None:
         parent_job_id=parent.job_id,
     )
     child.status = "running"
-    job_store.update(child)
+    seed_job(job_store, child)
     assert job_store.has_active_children(parent.job_id) is True
 
 

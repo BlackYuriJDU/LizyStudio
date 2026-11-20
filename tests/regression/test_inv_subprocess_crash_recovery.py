@@ -5,7 +5,8 @@ abnormal exit) without persisting a terminal status, the parent
 runner detects the death within bounded time and reconciles the
 on-disk job to ``status="failed"`` (or ``"cancelled"`` when a cancel
 was outstanding). Slot release follows via
-``_run_subprocess_job.finally``.
+``_run_subprocess_job.finally`` (P-0119: the reconcile's commit of the run
+token).
 
 The thin path-4 test in ``test_inv_slot_release.py`` covers the slot
 release shape using a mocked ``run_job_in_subprocess``. This module
@@ -37,13 +38,14 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 from unittest.mock import MagicMock
 
 import pytest
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import admit_running, fake_child_exit, seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -111,27 +113,22 @@ def test_inv6_subprocess_abnormal_exit_reconciles_to_failed(
     # Simulate the child having started — meta on disk shows
     # ``running``. The reconcile path must rewrite it.
     job.status = "running"
-    job_store.update(job)
+    seed_job(job_store, job)
     assert job_store.get(job.job_id).status == "running"  # type: ignore[union-attr]
 
-    def fake_run_subprocess(**kwargs: Any) -> Any:
-        # Re-load from disk and return as-is to simulate a child that
-        # exited without persisting a terminal. The real
-        # run_job_in_subprocess does this same reload + reconcile, so
-        # we drive the parent path by mimicking the abnormal-exit
-        # contract: the returned Job should already be reconciled in
-        # the production code, but we test the higher-level
-        # _run_subprocess_job.finally separately here.
-        return kwargs["job"]
-
-    monkeypatch.setattr(
-        "lizystudio.services.subprocess_runner.run_job_in_subprocess",
-        fake_run_subprocess,
-    )
+    # P-0119: the child exits without persisting a terminal (rc 1); the
+    # parent's real reconcile — a commit of the run token — writes
+    # ``failed`` and releases the slot.
+    fake_child_exit(monkeypatch, status=None, returncode=1)
 
     ws = _make_ws_mock()
     training_module._run_subprocess_job(
-        ws, job, job_store, broadcaster=MagicMock(), epoch=ws.current_epoch()
+        ws,
+        job,
+        job_store,
+        broadcaster=MagicMock(),
+        token=admit_running(job_store, job),
+        epoch=ws.current_epoch(),
     )
 
     assert job_store.active_job_id is None, (
@@ -170,7 +167,7 @@ def test_inv6_real_subprocess_sigkill_reconciles_within_bounded_time(
 
     job = _claim_job(job_store)
     job.status = "running"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     # Spawn a child that just sleeps. The real subprocess_runner
     # would write progress / call _run_job_core, but for INV-6 the
@@ -234,7 +231,7 @@ def test_inv6_real_subprocess_sigkill_reconciles_within_bounded_time(
                     "without persisting a terminal status"
                 )
             updated.completed_at = now
-            job_store.update(updated)
+            seed_job(job_store, updated)
 
         reloaded = job_store.get(job.job_id)
         assert reloaded is not None
@@ -277,36 +274,24 @@ def test_inv6_cancel_then_subprocess_kill_reconciles_to_cancelled(
 
     job = _claim_job(job_store)
     job.status = "running"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     # User cancels before the child crash.
     job_store.request_cancel(job.job_id)
 
-    def fake_run_subprocess(**kwargs: Any) -> Any:
-        # Reload + reconcile under the cancel branch.
-        from datetime import datetime, timezone
-
-        j = kwargs["job"]
-        store: JobStore = kwargs["job_store"]
-        latest = store.get(j.job_id)
-        assert latest is not None
-        if latest.status in ("pending", "running") and store.is_cancel_requested(
-            j.job_id
-        ):
-            latest.status = "cancelled"
-            latest.completed_at = datetime.now(timezone.utc).isoformat()
-            store.update(latest)
-            store.clear_cancel(j.job_id)
-        return latest
-
-    monkeypatch.setattr(
-        "lizystudio.services.subprocess_runner.run_job_in_subprocess",
-        fake_run_subprocess,
-    )
+    # P-0119: the child is killed (rc -15) without persisting a terminal; the
+    # parent's real reconcile commits the run token, and the accepted cancel
+    # turns that commit into ``cancelled``.
+    fake_child_exit(monkeypatch, status=None, returncode=-15)
 
     ws = _make_ws_mock()
     result = training_module._run_subprocess_job(
-        ws, job, job_store, broadcaster=MagicMock(), epoch=ws.current_epoch()
+        ws,
+        job,
+        job_store,
+        broadcaster=MagicMock(),
+        token=admit_running(job_store, job),
+        epoch=ws.current_epoch(),
     )
 
     assert result.status == "cancelled", (

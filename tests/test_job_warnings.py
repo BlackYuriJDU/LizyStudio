@@ -163,7 +163,9 @@ def test_a_failed_meta_write_is_logged_and_does_not_raise(
     store = JobStore(tmp_path / "jobs")
     job = _job(store)
     collector, _ = _collector(store, job)
-    store.update = MagicMock(side_effect=OSError("disk full"))  # type: ignore[method-assign]
+    # P-0119: warnings persist through the status-free, token-checked
+    # ``write_results`` (``update()`` no longer carries a status).
+    store.write_results = MagicMock(side_effect=OSError("disk full"))  # type: ignore[method-assign]
 
     with caplog.at_level(logging.WARNING, logger="lizystudio.services._job_warnings"):
         collector.record_warning("still kept", "UserWarning")

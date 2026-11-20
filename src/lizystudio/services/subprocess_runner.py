@@ -22,10 +22,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from lizystudio.services._job_lifecycle_types import Outcome, RunToken
+from lizystudio.services._job_sinks import LegacyChildStatusSink, emit_effects
+from lizystudio.services._progress_reader import _ProgressReader
+from lizystudio.services._training_core import _subprocess_duration_seconds
 from lizystudio.services.jobs import Job, JobStore
 
 if TYPE_CHECKING:
@@ -130,8 +133,12 @@ def run_job_in_subprocess(
     retune_expand_boundary: bool | None = None,
     retune_boundary_threshold: float | None = None,
     resume_from_existing_study: bool = False,
+    token: RunToken,
 ) -> Job:
     """Execute a job in a subprocess and return the updated Job.
+
+    *token* is the run token the launcher's admission issued (P-0119); the
+    reconcile commits the child's result through it.
 
     Progress is forwarded to *broadcaster* by polling a JSONL file
     written by the child process.
@@ -171,6 +178,7 @@ def run_job_in_subprocess(
         job_store=job_store,
         broadcaster=broadcaster,
         returncode=returncode,
+        token=token,
     )
 
 
@@ -321,146 +329,46 @@ def _reconcile_subprocess_result(
     job_store: JobStore,
     broadcaster: ProgressBroadcaster | None,
     returncode: int | None,
+    token: RunToken,
 ) -> Job:
-    """Reload the job the child persisted and fix up a stuck state.
+    """Commit the exited child's result through the parent's primitive.
 
-    If the child was killed mid-run (Cancel -> SIGTERM, or hard kill
-    after ``_WAIT_TIMEOUT``) it never reached ``_run_job_core.finally``
-    and so never wrote a terminal state back to disk. Reconcile here
-    based on the cancel flag so waiters downstream (E2E, UI) see the
-    final status instead of spinning on ``running`` forever.
+    P-0119: the reconcile is one ``commit`` of the run's *token*, under the
+    lifecycle lock, so a concurrent cancel sees either the run before it or
+    its terminal after it (窓4). Two cases:
 
-    *returncode* is :func:`_supervise_child`'s return value; it appears
-    in the "without persisting a terminal status" error message.
+    - the child persisted ``paused`` or a terminal (``LegacyChildStatusSink``,
+      PR-A): the parent **adopts** it — token, slot, flags and the one metric
+      are settled, and no second frame is sent (the child's frame was already
+      forwarded);
+    - the child died with the row still ``running`` (Cancel -> SIGTERM, a hard
+      kill, a crash in setup): ``failed`` is committed, which becomes
+      ``cancelled`` when a cancel was accepted (INV-LC-4).
+
+    *returncode* is :func:`_supervise_child`'s return value; it appears in
+    the "without persisting a terminal status" error message.
     """
     updated = job_store.get(job.job_id)
     if updated is None:
-        # Fallback: mark as failed if subprocess didn't persist
+        # The job directory is gone (deleted while it ran): drop the run.
+        job_store.abandon(token)
         job.status = "failed"
         job.error = "Subprocess did not persist job result"
         return job
-
     if updated.status in ("pending", "running"):
-        now = datetime.now(timezone.utc).isoformat()
-        cancelled = job_store.is_cancel_requested(job.job_id)
         failure = (
             f"Subprocess exited with code {returncode} "
             f"without persisting a terminal status"
         )
-        if cancelled:
-            updated.status = "cancelled"
-        else:
-            updated.status = "failed"
-            updated.error = failure
-        updated.completed_at = now
-        # Issue #612: persist before broadcasting. If the write raises, the
-        # launcher's guard settles the job and sends the one error frame;
-        # broadcasting first would make that a second frame.
-        job_store.update(updated)
-        job_store.clear_cancel(job.job_id)
-        if broadcaster is not None:
-            if cancelled:
-                broadcaster.send_error(
-                    job.job_id, "Job cancelled", code="JOB_CANCELLED"
-                )
-            else:
-                broadcaster.send_error(job.job_id, failure)
-    return updated
-
-
-class _ProgressReader:
-    """Tail-read the progress JSONL file one new chunk at a time.
-
-    Issue #87: the legacy poll loop read the whole progress file via
-    ``Path.read_text().splitlines()`` on every 200 ms tick and tracked a
-    consumed-line counter. That is O(N) per poll in the number of lines
-    already seen, so a long tune with hundreds of trials quadratically
-    degrades the parent thread as the file grows. It also silently
-    dropped partial writes (a ``write()`` that landed but whose
-    terminating newline had not flushed yet was parsed as invalid JSON
-    and thrown away, never to be retried).
-
-    This reader keeps an open file handle and reads only the new bytes
-    since the last call (``file.read()`` on a regular file with a live
-    offset). A small ``_buffer`` holds any unterminated trailing text
-    across calls so it is never lost — the next call stitches the
-    continuation on and returns the completed line.
-
-    The reader also handles the common "file does not exist yet"
-    startup case: ``_ensure_open`` retries on every call until the
-    child creates the file, at which point the handle opens and
-    subsequent calls stream from offset 0.
-    """
-
-    def __init__(self, path: str) -> None:
-        self._path = path
-        self._file: Any = None  # typing.IO[str] once opened
-        self._buffer = ""
-
-    def _ensure_open(self) -> bool:
-        """Open the file lazily if it has appeared on disk.
-
-        Returns True if a live handle is available after the call, and
-        False if the file still does not exist.
-        """
-        if self._file is not None:
-            return True
-        if not Path(self._path).exists():
-            return False
-        # Text mode with UTF-8 to match _write_progress; errors="replace"
-        # so a corrupt byte sequence in the middle of a long tune does
-        # not raise UnicodeDecodeError and kill the poll loop. A broken
-        # line will fail JSON parsing in _forward_progress and be
-        # dropped there with logging, which is the right failure mode.
-        self._file = open(  # noqa: SIM115 — handle lives with the reader
-            self._path, encoding="utf-8", errors="replace"
-        )
-        return True
-
-    def read_new_lines(self) -> list[str]:
-        """Return complete lines written since the last call.
-
-        Any partial trailing content (no terminating newline) is stashed
-        on ``self._buffer`` and only released once its continuation has
-        been written.
-        """
-        if not self._ensure_open():
-            return []
-        chunk = self._file.read()
-        if not chunk:
-            return []
-        data = self._buffer + chunk
-        # If the chunk ends with a newline, every line is complete and
-        # the buffer is empty; otherwise the last fragment is partial
-        # and we hold it until a later call completes it.
-        if data.endswith("\n"):
-            self._buffer = ""
-            return [ln for ln in data.splitlines() if ln]
-        parts = data.split("\n")
-        self._buffer = parts[-1]
-        return [ln for ln in parts[:-1] if ln]
-
-    def final_flush(self) -> list[str]:
-        """Return any buffered partial line and clear the buffer.
-
-        Called by ``_poll_progress`` after the subprocess has exited and
-        the poll retries have finished. If the child was killed
-        mid-write, its last bytes live here as a best-effort tail; the
-        caller decides whether to forward them (they probably fail JSON
-        parsing, but at least they land in logs).
-        """
-        if not self._buffer:
-            return []
-        tail = self._buffer
-        self._buffer = ""
-        return [tail]
-
-    def close(self) -> None:
-        """Release the file handle. Safe to call multiple times."""
-        if self._file is not None:
-            with contextlib.suppress(Exception):
-                self._file.close()
-            self._file = None
+        outcome = Outcome(status="failed", error=failure, message=failure)
+    else:
+        outcome = Outcome(status=updated.status, adopted=True)  # type: ignore[arg-type]
+    effects = job_store.commit(token, outcome)
+    latest = job_store.get(job.job_id) or updated
+    emit_effects(
+        job_store, broadcaster, effects, duration=_subprocess_duration_seconds(latest)
+    )
+    return latest
 
 
 def _poll_progress(
@@ -596,7 +504,7 @@ def _install_sigterm_handler() -> None:
 
     Python's default SIGTERM handler calls ``_exit`` which bypasses
     every Python-level ``finally`` block. That caused
-    ``_run_job_core.finally`` to skip — no ``execution.log`` write,
+    ``_run_job_core``'s ``finally`` to skip — no ``execution.log`` write,
     no ``release_active``, no terminal metric — whenever the parent
     escalated a cancel to SIGTERM.
 
@@ -605,10 +513,10 @@ def _install_sigterm_handler() -> None:
     ``except (CancelledError, KeyboardInterrupt)`` branch in
     ``_run_job_core`` and runs the existing ``finally``.
 
-    Single-shot (INV-8): the handler resets itself to ``SIG_DFL``
-    on entry so a second SIGTERM falls through to the OS default —
-    this keeps the parent's ``proc.kill()`` / SIGKILL escalation
-    intact for a truly hung child.
+    Single-shot (INV-8): the first SIGTERM raises ``KeyboardInterrupt``;
+    a second one restores ``SIG_DFL`` and re-sends SIGTERM, which ends
+    the process — so a truly hung child still dies, and the parent's
+    ``proc.kill()`` / SIGKILL escalation stays a backstop.
     """
     import _thread
     import signal as _signal
@@ -634,7 +542,7 @@ def _install_sigterm_handler() -> None:
             return
         fired["once"] = True
         # First SIGTERM: inject KeyboardInterrupt on the main thread
-        # so _run_job_core.finally runs.
+        # so _run_job_core's finally (the execution.log write) runs.
         _thread.interrupt_main()
 
     with contextlib.suppress(Exception):
@@ -644,8 +552,10 @@ def _install_sigterm_handler() -> None:
 def _child_main(args_path: str, progress_path: str) -> None:
     """Entry point for the child process."""
     # Issue #153: install SIGTERM → KeyboardInterrupt before doing any
-    # real work so a parent-triggered SIGTERM during setup still runs
-    # the _run_job_core finally block.
+    # real work. A first SIGTERM during setup raises KeyboardInterrupt here,
+    # so the child exits without writing a status and the parent's reconcile
+    # commits ``cancelled`` / ``failed`` (P-0119). A second SIGTERM restores
+    # ``SIG_DFL`` and re-sends the signal, which ends the process (INV-8).
     _install_sigterm_handler()
     # P-0117 D4: the job-warning hooks, once, before any thread or job.
     from lizystudio.services._job_warnings import install_job_warning_hooks
@@ -654,14 +564,16 @@ def _child_main(args_path: str, progress_path: str) -> None:
 
     with open(args_path, encoding="utf-8") as f:
         args = json.load(f)
+    # P-0119: test-only barrier, inert unless the test sets its env variable.
+    from lizystudio.services import _child_barrier
+
+    _child_barrier.activate_from_env()
+    _child_barrier.barrier("setup")
 
     job_id: str = args["job_id"]
     jobs_dir = Path(args["jobs_dir"])
     backend_name: str = args["backend_name"]
-    config: dict[str, Any] = args["config"]
     data_path: str = args["data_path"]
-    job_type: str = args["job_type"]
-    mode: str = args.get("mode", "job")
 
     # Reconstruct dependencies in subprocess
     from lizystudio.backends.registry import get_adapter
@@ -679,61 +591,103 @@ def _child_main(args_path: str, progress_path: str) -> None:
     adapter = get_adapter(backend_name)
     dataframe = load_dataframe(data_path)
 
+    _child_dispatch(args, job, job_store, adapter, dataframe, progress_path)
+
+
+def _child_dispatch(
+    args: dict[str, Any],
+    job: Job,
+    job_store: JobStore,
+    adapter: Any,
+    dataframe: Any,
+    progress_path: str,
+) -> None:
+    """Run the child's job (fit / tune / retune) with the legacy sink."""
+    config: dict[str, Any] = args["config"]
+    job_type: str = args["job_type"]
+    mode: str = args.get("mode", "job")
     # Build a broadcaster-like wrapper that writes to progress file
     file_broadcaster = _FileBroadcaster(progress_path)
 
-    from lizystudio.services.training import run_fit, run_retune, run_tune
+    from lizystudio.services.training import run_fit, run_tune
 
     # _FileBroadcaster is duck-type compatible with ProgressBroadcaster
     broadcaster_any: Any = file_broadcaster
+    # P-0119 (PR-A): the child's one status writer; PR-B replaces it with an
+    # outcome file the parent commits.
+    sink = LegacyChildStatusSink(job_store, broadcaster_any)
 
     if mode == "retune":
-        parent_job_id = args["parent_job_id"]
-        parent = job_store.get(parent_job_id)
-        if parent is None:
-            _write_progress(
-                progress_path,
-                {"type": "error", "message": f"Parent job {parent_job_id} not found"},
-            )
-            sys.exit(1)
-        run_retune(
-            parent_job=parent,
-            child_job=job,
-            job_store=job_store,
-            backend=adapter,
-            dataframe=dataframe,
-            n_trials=int(args["retune_n_trials"]),
-            expand_boundary=args.get("retune_expand_boundary"),
-            boundary_threshold=args.get("retune_boundary_threshold"),
-            broadcaster=broadcaster_any,
+        _child_retune(
+            args,
+            job,
+            job_store,
+            adapter,
+            dataframe,
+            progress_path,
+            broadcaster_any,
+            sink,
         )
-    elif job_type == "fit":
-        run_fit(
-            job=job,
-            job_store=job_store,
-            backend=adapter,
-            config=config,
-            dataframe=dataframe,
-            broadcaster=broadcaster_any,
-        )
-    elif job_type == "tune":
-        run_tune(
-            job=job,
-            job_store=job_store,
-            backend=adapter,
-            config=config,
-            dataframe=dataframe,
-            broadcaster=broadcaster_any,
-            resume_from_existing_study=bool(
-                args.get("resume_from_existing_study", False)
-            ),
-        )
-    else:
+        return
+    if job_type not in ("fit", "tune"):
         _write_progress(
             progress_path,
             {"type": "error", "message": f"Unknown job_type: {job_type}"},
         )
         sys.exit(1)
+    runner: Any = run_fit if job_type == "fit" else run_tune
+    extra: dict[str, Any] = {}
+    if job_type == "tune":
+        extra["resume_from_existing_study"] = bool(
+            args.get("resume_from_existing_study", False)
+        )
+    runner(
+        job=job,
+        job_store=job_store,
+        backend=adapter,
+        config=config,
+        dataframe=dataframe,
+        broadcaster=broadcaster_any,
+        sink=sink,
+        **extra,
+    )
+
+
+def _child_retune(
+    args: dict[str, Any],
+    job: Job,
+    job_store: JobStore,
+    adapter: Any,
+    dataframe: Any,
+    progress_path: str,
+    broadcaster: Any,
+    sink: LegacyChildStatusSink,
+) -> None:
+    """The child's Re-tune run (H-0062 Bugfix 2026-04-14)."""
+    from lizystudio.services.training import run_retune
+
+    parent = job_store.get(args["parent_job_id"])
+    if parent is None:
+        _write_progress(
+            progress_path,
+            {
+                "type": "error",
+                "message": f"Parent job {args['parent_job_id']} not found",
+            },
+        )
+        sys.exit(1)
+    run_retune(
+        parent_job=parent,
+        child_job=job,
+        job_store=job_store,
+        backend=adapter,
+        dataframe=dataframe,
+        n_trials=int(args["retune_n_trials"]),
+        expand_boundary=args.get("retune_expand_boundary"),
+        boundary_threshold=args.get("retune_boundary_threshold"),
+        broadcaster=broadcaster,
+        sink=sink,
+    )
 
 
 class _FileBroadcaster:

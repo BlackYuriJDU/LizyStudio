@@ -19,10 +19,14 @@ raises ``KeyboardInterrupt`` on the main thread so the existing
   ``try`` becomes a ``KeyboardInterrupt`` that the ``except`` catches.
   They do not run ``_child_main`` or ``_run_job_core``, so they do NOT
   cover a SIGTERM that arrives during ``_child_main`` setup, before
-  ``_run_job_core``'s ``try`` is entered; that window is unguarded.
-- INV-8: the SIGTERM handler is single-shot. A second SIGTERM is
-  a no-op (handler reset to SIG_DFL so SIGKILL-class escalation
-  via ``proc.kill()`` still works).
+  ``_run_job_core``'s ``try`` is entered. P-0119: that window now exits
+  the child without a status write, and the parent's reconcile commits
+  ``cancelled`` / ``failed`` (``test_reg_0697_child_windows.py``).
+- INV-8: the SIGTERM handler is single-shot. The first SIGTERM raises
+  ``KeyboardInterrupt`` on the main thread; the second restores
+  ``SIG_DFL`` and re-sends SIGTERM, which ends the process (it is not a
+  no-op), so a hung child still dies and ``proc.kill()`` stays a backstop
+  (comment corrected by P-0119; assertions unchanged).
 """
 
 from __future__ import annotations

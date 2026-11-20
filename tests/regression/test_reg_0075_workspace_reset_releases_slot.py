@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import admit_running, seed_job
 
 pytestmark = pytest.mark.unit
 
@@ -62,9 +63,10 @@ def _seed_running_active_job(store: JobStore) -> str:
         data_ref=data_ref,
         job_type="fit",
     )
-    job.status = "running"
-    store.update(job)
-    assert store.claim_active(job.job_id), "baseline precondition: slot free"
+    # P-0119: a live run is an admitted run (``running`` + token + slot);
+    # ``update()`` no longer writes the status.
+    assert store.active_job_id is None, "baseline precondition: slot free"
+    admit_running(store, job)
     return job.job_id
 
 
@@ -137,7 +139,7 @@ def test_reset_with_completed_slot_holder_releases_slot(
     # in the runner finally, so it should not happen in the happy path,
     # but reset must be robust against it.
     job.status = "completed"
-    store.update(job)
+    seed_job(store, job)
     store.claim_active(job.job_id)
     assert store.has_active_job()
 

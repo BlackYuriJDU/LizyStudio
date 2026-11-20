@@ -24,7 +24,8 @@ INV-pause-3: ``request_pause`` / ``is_pause_requested`` / ``clear_pause``
   are thread-safe under concurrent writes — the count of pause-requested
   job ids equals the number of distinct ``request_pause`` callers.
 
-INV-pause-4 (state-machine guard): ``JobStore.set_status`` enforces
+INV-pause-4 (state-machine guard): the P-0119 status writer (formerly
+  ``JobStore.set_status``) enforces
   P-0099 INV-3 ``LEGAL_TRANSITIONS`` at write time; illegal transitions
   raise instead of silently rewriting status.  The matching xfail in
   ``tests/regression/test_inv_state_machine.py`` flips to green in this
@@ -47,6 +48,7 @@ from lizystudio.backends.exceptions import PausedError
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services._training_core import _make_cancel_aware_cb, _run_job_core
 from lizystudio.services.jobs import Job, JobStore
+from tests.lifecycle_seed import admit_running, admitted_sink, guarded_status
 
 pytestmark = pytest.mark.unit
 
@@ -111,6 +113,7 @@ def test_paused_branch_keeps_active_slot(job_store: JobStore) -> None:
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_pause,
+        sink=admitted_sink(job_store, job, None),
     )
 
     assert result.status == "paused", "PausedError must land on the paused branch"
@@ -122,14 +125,19 @@ def test_paused_branch_keeps_active_slot(job_store: JobStore) -> None:
     )
 
 
-def test_paused_branch_does_not_clear_cancel_flag(job_store: JobStore) -> None:
-    """The paused finally-branch skips ``clear_cancel`` so a concurrent
-    cancel observed during pause is preserved for the resume worker.
+def test_paused_branch_with_a_pending_cancel_commits_cancelled(
+    job_store: JobStore,
+) -> None:
+    """A ``paused`` outcome with CANCEL set commits ``cancelled``.
+
+    Overturned by P-0119 (pause, "CANCEL があれば cancelled を書く"; Compatibility
+    状態: "paused と CANCEL が同時に立つ状態は無くなる"). Before P-0119 the
+    paused branch kept the job ``paused`` and the CANCEL flag for the resume
+    worker; now the commit resolves the accepted cancel at once: the job is
+    ``cancelled``, the slot is released and both flags are cleared.
 
     Practical case: user clicks Pause, then immediately Cancel before the
-    worker's checkpoint write finishes.  The cancel flag must survive into
-    the next attempt to resume so the resume cycle short-circuits to
-    ``cancelled`` instead of running another silent trial.
+    worker's checkpoint write finishes.
     """
     job = _claim_job(job_store)
     job_store.request_cancel(job.job_id)
@@ -143,11 +151,15 @@ def test_paused_branch_does_not_clear_cancel_flag(job_store: JobStore) -> None:
         job_store=job_store,
         broadcaster=None,
         execute_fn=execute_pause,
+        sink=admitted_sink(job_store, job, None),
     )
 
-    assert job_store.is_cancel_requested(job.job_id) is True, (
-        "INV-pause-1: paused finally must NOT clear the cancel flag"
-    )
+    stored = job_store.get(job.job_id)
+    assert stored is not None
+    assert stored.status == "cancelled"
+    assert job_store.active_job_id is None
+    assert job_store.is_cancel_requested(job.job_id) is False
+    assert job_store.is_pause_requested(job.job_id) is False
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +254,7 @@ def test_clear_pause_removes_observation(job_store: JobStore) -> None:
 
 
 # ---------------------------------------------------------------------------
-# INV-pause-4: set_status enforces INV-3 LEGAL_TRANSITIONS.
+# INV-pause-4: the P-0119 status writer (was set_status) enforces INV-3.
 # ---------------------------------------------------------------------------
 
 
@@ -256,7 +268,7 @@ def test_set_status_allows_legal_pending_to_running(job_store: JobStore) -> None
     )
     assert job.status == "pending"
 
-    job_store.set_status(job.job_id, "running")
+    guarded_status(job_store, job.job_id, "running")
 
     reloaded = job_store.get(job.job_id)
     assert reloaded is not None
@@ -271,9 +283,9 @@ def test_set_status_allows_running_to_paused_and_back(job_store: JobStore) -> No
         data_ref=_make_data_ref(),
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
-    job_store.set_status(job.job_id, "paused")
-    job_store.set_status(job.job_id, "running")
+    guarded_status(job_store, job.job_id, "running")
+    guarded_status(job_store, job.job_id, "paused")
+    guarded_status(job_store, job.job_id, "running")
 
     reloaded = job_store.get(job.job_id)
     assert reloaded is not None
@@ -290,7 +302,7 @@ def test_set_status_rejects_illegal_skip_to_completed(job_store: JobStore) -> No
     )
 
     with pytest.raises(AssertionError):
-        job_store.set_status(job.job_id, "completed")
+        guarded_status(job_store, job.job_id, "completed")
 
 
 def test_set_status_rejects_terminal_outgoing(job_store: JobStore) -> None:
@@ -301,11 +313,11 @@ def test_set_status_rejects_terminal_outgoing(job_store: JobStore) -> None:
         data_ref=_make_data_ref(),
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
-    job_store.set_status(job.job_id, "completed")
+    guarded_status(job_store, job.job_id, "running")
+    guarded_status(job_store, job.job_id, "completed")
 
     with pytest.raises(AssertionError):
-        job_store.set_status(job.job_id, "running")
+        guarded_status(job_store, job.job_id, "running")
 
 
 def test_set_status_rejects_self_loop(job_store: JobStore) -> None:
@@ -316,10 +328,10 @@ def test_set_status_rejects_self_loop(job_store: JobStore) -> None:
         data_ref=_make_data_ref(),
         job_type="tune",
     )
-    job_store.set_status(job.job_id, "running")
+    guarded_status(job_store, job.job_id, "running")
 
     with pytest.raises(AssertionError):
-        job_store.set_status(job.job_id, "running")
+        guarded_status(job_store, job.job_id, "running")
 
 
 # ---------------------------------------------------------------------------
@@ -346,8 +358,8 @@ def test_has_active_children_counts_paused_as_active(job_store: JobStore) -> Non
     )
     # Drive the child through running -> paused via the runtime guard so
     # the test exercises the same path the /pause endpoint will use.
-    job_store.set_status(child.job_id, "running")
-    job_store.set_status(child.job_id, "paused")
+    guarded_status(job_store, child.job_id, "running")
+    guarded_status(job_store, child.job_id, "paused")
 
     assert job_store.has_active_children(parent.job_id) is True, (
         "INV-pause-5: paused children block non-cascade parent delete"
@@ -392,6 +404,7 @@ def test_paused_branch_invokes_broadcaster_send_paused(
         job_store=job_store,
         broadcaster=broadcaster,
         execute_fn=execute_pause,
+        sink=admitted_sink(job_store, job, broadcaster),
     )
 
     broadcaster.send_paused.assert_called_once()
@@ -413,8 +426,8 @@ def test_subprocess_finally_keeps_slot_when_child_wrote_paused(
     job_store = JobStore(tmp_path / "jobs")
     job = _claim_job(job_store)
     # Simulate the subprocess child having persisted paused status.
-    job_store.set_status(job.job_id, "running")
-    job_store.set_status(job.job_id, "paused")
+    guarded_status(job_store, job.job_id, "running")
+    guarded_status(job_store, job.job_id, "paused")
     assert job_store.active_job_id == job.job_id
 
     # Stub the actual subprocess run so the test stays in-process.
@@ -439,7 +452,12 @@ def test_subprocess_finally_keeps_slot_when_child_wrote_paused(
     ws.record_completion = MagicMock()
 
     tc._run_subprocess_job(
-        ws, job, job_store, broadcaster=None, epoch=ws.current_epoch()
+        ws,
+        job,
+        job_store,
+        broadcaster=None,
+        token=admit_running(job_store, job),
+        epoch=ws.current_epoch(),
     )
 
     assert job_store.active_job_id == job.job_id, (

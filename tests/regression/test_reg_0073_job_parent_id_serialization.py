@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from lizystudio.backends.types import DataRef
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.integration
 
@@ -39,7 +40,7 @@ def _seed_parent_and_child(job_store: JobStore) -> tuple[str, str]:
         job_type="tune",
     )
     parent.status = "completed"
-    job_store.update(parent)
+    seed_job(job_store, parent)
 
     child = job_store.create(
         backend_name="lizyml",
@@ -55,7 +56,7 @@ def _seed_parent_and_child(job_store: JobStore) -> tuple[str, str]:
         parent_job_id=parent.job_id,
     )
     child.status = "completed"
-    job_store.update(child)
+    seed_job(job_store, child)
 
     return parent.job_id, child.job_id
 

@@ -33,6 +33,7 @@ from lizystudio.backends.lizyml.evaluation_mixin import EvaluationMixin
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services.inference import InferenceRecord, InferenceStore
 from lizystudio.services.jobs import JobStore
+from tests.lifecycle_seed import seed_job
 
 pytestmark = pytest.mark.integration
 
@@ -122,7 +123,7 @@ def _create_inference_setup(
         params=[],
     )
     job.model_path = "/fake/model/path"
-    job_store.update(job)
+    seed_job(job_store, job)
 
     inf_store = InferenceStore(job_store.jobs_dir)
     pred_df = pd.DataFrame(

@@ -23,8 +23,11 @@ from lizystudio.api.workspace import workspace_reset
 from lizystudio.backends.registry import get_adapter
 from lizystudio.backends.types import DataRef, FitSummary
 from lizystudio.services import training, training_retune
+from lizystudio.services._job_lifecycle_types import Outcome
+from lizystudio.services._job_sinks import ParentCommitSink
 from lizystudio.services.jobs import Job, JobStore
 from lizystudio.services.workspace import WorkspaceState
+from tests.lifecycle_seed import reserve_for_launch, seed_job
 
 _REF = DataRef(
     source_type="path",
@@ -58,12 +61,27 @@ def _job(store: JobStore, job_type: str = "fit") -> Job:
     )
 
 
+# P-0119: the launcher hands its fake runner the sink of the admitted run;
+# ``_finish`` commits through it, as the real core does.
+_SINKS: dict[str, ParentCommitSink] = {}
+
+
 def _finish(store: JobStore, job: Job, status: str = "completed") -> Job:
-    """Persist a terminal status the way the real core does, then return."""
-    job.status = status  # type: ignore[assignment]
+    """Commit a terminal status the way the real core does, then return."""
     job.fit_result = _FIT if status == "completed" else None
-    store.update(job)
+    sink = _SINKS.get(job.job_id)
+    if sink is None:
+        job.status = status  # type: ignore[assignment]
+        seed_job(store, job)
+        return job
+    sink.write_results(job)
+    sink.commit(job, Outcome(status=status), 0.0)  # type: ignore[arg-type]
     return job
+
+
+def _run_with(runner: Runner, job: Job, sink: ParentCommitSink) -> Job:
+    _SINKS[job.job_id] = sink
+    return runner(job)
 
 
 class _Gate:
@@ -93,15 +111,23 @@ def _route(
         )
         monkeypatch.setattr(
             "lizystudio.services.subprocess_runner.run_job_in_subprocess",
-            lambda *, job, **_: runner(job),
+            lambda *, job, job_store, token, **_: _run_with(
+                runner, job, ParentCommitSink(job_store, None, token)
+            ),
         )
     elif kind == "fit":
-        monkeypatch.setattr(training, "run_fit", lambda *, job, **_: runner(job))
+        monkeypatch.setattr(
+            training, "run_fit", lambda *, job, sink, **_: _run_with(runner, job, sink)
+        )
     elif kind == "tune":
-        monkeypatch.setattr(training, "run_tune", lambda *, job, **_: runner(job))
+        monkeypatch.setattr(
+            training, "run_tune", lambda *, job, sink, **_: _run_with(runner, job, sink)
+        )
     else:
         monkeypatch.setattr(
-            training_retune, "run_retune", lambda *, child_job, **_: runner(child_job)
+            training_retune,
+            "run_retune",
+            lambda *, child_job, sink, **_: _run_with(runner, child_job, sink),
         )
 
 
@@ -125,6 +151,7 @@ def _prepare(
                 expand_boundary=None,
                 boundary_threshold=None,
                 mode="retune",
+                reset_gen=reserve_for_launch(store, child),
             )
 
         return child, _launch_retune
@@ -139,6 +166,7 @@ def _prepare(
             config={},
             dataframe=None,
             job=job,
+            reset_gen=reserve_for_launch(store, job),
         )
 
     return job, _launch
@@ -225,7 +253,7 @@ def test_api_reset_cancelling_a_running_job_is_not_undone(
 
     def _cancellable(j: Job) -> Job:
         j.status = "running"
-        store.update(j)
+        seed_job(store, j)
         running.set()
         deadline = time.monotonic() + _WAIT
         while not store.is_cancel_requested(j.job_id):
@@ -275,6 +303,7 @@ def _prepare_existing(
             config={},
             dataframe=None,
             job=job,
+            reset_gen=reserve_for_launch(store, job),
         )
 
     return job, _launch
@@ -367,7 +396,7 @@ def test_reset_during_retune_launch_fences_the_failure_note(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A reset during the retune join clears the dataframe, so the launcher
-    takes its inline-failure path (``_mark_retune_child_failed`` ->
+    takes its inline-failure path (P-0119: an ``abort`` of the admission ->
     ``note_current_job``); that write predates the reset and is dropped."""
     store = JobStore(tmp_path)
     ws = _ws()
@@ -411,11 +440,17 @@ def test_early_failure_note_after_reset_is_fenced(
 def test_relaunching_the_same_job_after_reset_records_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The fence is per launcher invocation, not per job id."""
+    """The fence is per launcher invocation, not per job id.
+
+    P-0119 (受付, expected status): admission refuses a terminal job, so the
+    same job id can be launched again only through ``/unpause``. The first
+    run therefore ends ``paused`` (not ``completed``), and the second
+    invocation is the unpause of that job after the workspace reset.
+    """
     store = JobStore(tmp_path)
     ws = _ws()
     job, launch = _prepare(store, ws, "tune")
-    gate = _Gate(store)
+    gate = _Gate(store, "paused")
     _route(monkeypatch, "tune", "thread", gate)
     started = _capture_thread(monkeypatch)
 
@@ -425,10 +460,20 @@ def test_relaunching_the_same_job_after_reset_records_again(
     gate.release.set()
     _join(started[-1])
     _assert_workspace_clear(ws)
+    assert store.get(job.job_id).status == "paused"  # type: ignore[union-attr]
 
-    # Second invocation, after the reset: it records normally.
+    # Second invocation (the unpause), after the reset: it records normally.
     _route(monkeypatch, "tune", "thread", lambda j: _finish(store, j))
-    launch()
+    training.start_tune_async(
+        ws=ws,
+        job_store=store,
+        broadcaster=None,  # type: ignore[arg-type]
+        config={},
+        dataframe=None,
+        job=job,
+        reset_gen=store.capture_reset_gen(),
+        resume_from_existing_study=True,
+    )
     _join(started[-1])
     assert ws.current_job_id == job.job_id
 
