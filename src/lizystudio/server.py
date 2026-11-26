@@ -372,6 +372,7 @@ def _install_ws_message_schema(application: FastAPI) -> None:
     from fastapi.openapi.utils import get_openapi
     from pydantic import TypeAdapter
 
+    from lizystudio.api.models import ProblemDetails
     from lizystudio.ws.messages import (
         WsCompleted,
         WsError,
@@ -417,6 +418,12 @@ def _install_ws_message_schema(application: FastAPI) -> None:
                 schemas[name] = model.model_json_schema(
                     ref_template="#/components/schemas/{model}",
                 )
+        # P-0110: the workspace routes reference ``ProblemDetails`` under
+        # ``application/problem+json`` by ``$ref`` (see
+        # ``api.models.problem_responses``); register the component here.
+        schemas["ProblemDetails"] = ProblemDetails.model_json_schema(
+            ref_template="#/components/schemas/{model}",
+        )
         application.openapi_schema = schema
         return schema
 

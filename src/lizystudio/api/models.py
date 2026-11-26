@@ -110,11 +110,68 @@ class WorkspaceStatusResponse(BaseModel):
 
 
 class ConfigUpdateResponse(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    """200 body of ``PUT /config`` and ``POST /config/upload`` (P-0110).
+
+    A 200 means the config was saved (INV-API-1), so there is no
+    ``saved`` flag. ``validation_errors`` holds only non-blocking
+    entries (``severity`` ``"warning"`` / ``"info"``, P-0100); a blocking
+    entry answers 422 :class:`ProblemDetails` instead.
+    """
 
     config: dict[str, Any]
-    errors: list[dict[str, Any]]
-    saved: bool
+    validation_errors: list[dict[str, Any]]
+
+
+class ProblemDetails(BaseModel):
+    """RFC 9457 error body of the workspace endpoints (P-0110).
+
+    Served as ``application/problem+json``. ``type`` is always
+    ``about:blank`` (Decision Q2), so ``title`` is the HTTP reason
+    phrase; ``code`` is the LizyStudio error code (BLUEPRINT §6.1).
+    Every member is always sent; ``validation_errors`` is a list on
+    ``VALIDATION_ERROR`` and null otherwise.
+    """
+
+    type: str = "about:blank"
+    title: str
+    status: int
+    detail: str
+    code: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    validation_errors: list[dict[str, Any]] | None = None
+
+
+_PROBLEM_DESCRIPTIONS: dict[int, str] = {
+    400: "Request refused (RFC 9457 Problem Details)",
+    409: "Conflict, e.g. WORKSPACE_LOCKED or JOB_CONFLICT (RFC 9457 Problem Details)",
+    422: (
+        "Blocking config validation, VALIDATION_ERROR with validation_errors "
+        "(RFC 9457 Problem Details). A request body that fails to parse "
+        "still answers 422 with the legacy error envelope."
+    ),
+}
+
+
+def problem_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
+    """OpenAPI ``responses`` entries for a workspace route's error bodies (P-0110).
+
+    Each entry points at the ``ProblemDetails`` component under the
+    ``application/problem+json`` media type. The component is registered
+    by ``server._install_ws_message_schema``'s OpenAPI hook, because a
+    ``responses`` entry with a ``model`` would be filed under
+    ``application/json``.
+    """
+    return {
+        code: {
+            "description": _PROBLEM_DESCRIPTIONS[code],
+            "content": {
+                "application/problem+json": {
+                    "schema": {"$ref": "#/components/schemas/ProblemDetails"}
+                }
+            },
+        }
+        for code in status_codes
+    }
 
 
 class ConfigPatchResponse(BaseModel):
