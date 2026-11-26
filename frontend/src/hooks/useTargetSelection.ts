@@ -1,10 +1,6 @@
 import { useCallback } from "react";
 import { toast } from "sonner";
-import {
-  getErrorMessage,
-  getValidationErrors,
-  summarizeValidationErrors,
-} from "@/api/errors";
+import { getErrorMessage } from "@/api/errors";
 import type { ColumnInfo, UiSchema } from "@/api/types";
 import { fetchColumns, fetchConfigDefaults } from "@/api/workspace";
 import type { BlockedGroupKFoldState } from "@/components/workspace/BlockedGroupKFoldEditor";
@@ -14,6 +10,7 @@ import {
   resetCvState,
 } from "@/components/workspace/cv-state";
 import { evalMetricMap } from "@/components/workspace/metric-options";
+import { surfaceWriteFailure } from "./surfaceWriteFailure";
 import type { ConfigWriteFunnel } from "./useConfigWriteFunnel";
 import {
   buildMergedConfig,
@@ -157,17 +154,8 @@ export function useTargetSelection({
               reason: "target-select",
             });
             // P-0110: a rejected write (422 / 409 / network) is surfaced,
-            // not dropped. An aborted write means the caller tore down.
-            if (!result.ok && result.error !== "aborted") {
-              const validationErrors = getValidationErrors(result.details);
-              toast.error(
-                `Config not saved: ${
-                  validationErrors !== null
-                    ? summarizeValidationErrors(validationErrors)
-                    : getErrorMessage(result.details ?? result.error)
-                }`,
-              );
-            }
+            // not dropped.
+            surfaceWriteFailure(result);
           } else if (legacyUpdateConfig) {
             await legacyUpdateConfig.putConfig(merged);
             legacyUpdateConfig.setQueryData(merged);

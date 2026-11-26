@@ -18,7 +18,11 @@ import {
   type CvState,
   INITIAL_CV_STATE,
 } from "@/components/workspace/cv-state";
-import { N_SPLITS_ERROR, validationProblem } from "@/test/problemDetails";
+import {
+  N_SPLITS_ERROR,
+  validationProblem,
+  workspaceLockedProblem,
+} from "@/test/problemDetails";
 import type { WriteResult } from "./useConfigWriteFunnel";
 
 const mocks = vi.hoisted(() => ({
@@ -26,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   fetchConfigDefaults: vi.fn(),
   updateConfig: vi.fn(),
   toastError: vi.fn(),
+  toastInfo: vi.fn(),
 }));
 
 vi.mock("@/api/workspace", () => ({
@@ -38,7 +43,7 @@ vi.mock("sonner", () => ({
   toast: {
     error: mocks.toastError,
     success: vi.fn(),
-    info: vi.fn(),
+    info: mocks.toastInfo,
     warning: vi.fn(),
   },
 }));
@@ -337,6 +342,24 @@ describe("useTargetSelection", () => {
       expect(mocks.toastError).toHaveBeenCalledWith(
         `Config not saved: ${N_SPLITS_ERROR.message}`,
       );
+    });
+
+    it("shows a locked write as the quiet info toast, not an error", async () => {
+      const { hook } = renderWithFunnel({
+        ok: false,
+        error: "locked",
+        details: workspaceLockedProblem(),
+      });
+
+      await act(async () => {
+        await hook.current.handleTargetChange("a");
+      });
+
+      expect(mocks.toastInfo).toHaveBeenCalledTimes(1);
+      expect(mocks.toastInfo).toHaveBeenCalledWith(
+        "Config is locked while a job is running",
+      );
+      expect(mocks.toastError).not.toHaveBeenCalled();
     });
 
     it("does not toast an aborted write", async () => {

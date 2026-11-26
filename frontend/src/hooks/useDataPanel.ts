@@ -100,7 +100,7 @@ export function useDataPanel({
   // writes (Load Preset, undo/redo) resume their normal back-sync.
   //
   // The latch also auto-expires after ``LATCH_TTL_MS`` so that a
-  // backend rejection (PUT returns ``saved=false`` and the cache
+  // backend rejection (PUT returns 422 since P-0110, and the cache
   // never catches up) doesn't permanently lock out subsequent
   // external writes such as Load Preset. The TTL is comfortably
   // larger than the worst-case in-flight PUT (~500 ms) and small
