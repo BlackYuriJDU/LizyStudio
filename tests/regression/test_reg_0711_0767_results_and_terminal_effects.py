@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+import lizystudio.services._job_metadata as metadata_mod
 import lizystudio.services.openmp_detect as openmp_detect_mod
 from lizystudio.backends.types import DataRef, FitSummary, TuningSummary
 from lizystudio.services._job_lifecycle_types import Outcome
@@ -109,20 +110,26 @@ def _count_terminal(job_store: JobStore, monkeypatch: pytest.MonkeyPatch) -> lis
 
 
 def _results_at_completed_write(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
-    """Record, for every ``completed`` status write, whether the job's
-    results were already on disk when the status was about to be written."""
+    """Record, for the ``meta.json`` write that first publishes ``completed``,
+    whether the job's result sidecars were already on disk.
+
+    Every ``meta.json`` write goes through :meth:`JobMetadataStore.save_meta`
+    (the primitive's ``write_status_locked`` and the status-free ``update``
+    alike), so the spy sees the publication whichever writer makes it.
+    """
     seen: list[bool] = []
-    original = JobMetadataStore.write_status_locked
+    original = JobMetadataStore.save_meta
 
-    def spy(store: JobMetadataStore, job_id: str, status: str, **kwargs: Any) -> None:
-        if status == "completed":
-            on_disk = store.load_job(job_id)
-            seen.append(on_disk.fit_result is not None)
-            if on_disk.job_type == "tune":
-                seen.append(on_disk.tune_result is not None)
-        original(store, job_id, status, **kwargs)
+    def spy(store: JobMetadataStore, job: Job) -> None:
+        meta = store.path_for(job.job_id, "meta")
+        before = store.load_job(job.job_id).status if meta.exists() else None
+        if job.status == "completed" and before != "completed":
+            seen.append(store.path_for(job.job_id, "fit_result").exists())
+            if job.job_type == "tune":
+                seen.append(store.path_for(job.job_id, "tune_result").exists())
+        original(store, job)
 
-    monkeypatch.setattr(JobMetadataStore, "write_status_locked", spy)
+    monkeypatch.setattr(JobMetadataStore, "save_meta", spy)
     return seen
 
 
@@ -154,7 +161,11 @@ def _join(ws: WorkspaceState) -> None:
     assert not thread.is_alive()
 
 
-def _frame_counts(broadcaster: MagicMock) -> tuple[int, int]:
+def _frame_counts(broadcaster: MagicMock, job_id: str) -> tuple[int, int]:
+    """(completed frames, error frames); every frame must target *job_id*."""
+    for sent in (broadcaster.send_completed, broadcaster.send_error):
+        for call in sent.call_args_list:
+            assert call.args[0] == job_id
     return broadcaster.send_completed.call_count, broadcaster.send_error.call_count
 
 
@@ -191,7 +202,7 @@ def test_results_are_on_disk_before_completed_is_written_in_thread_mode(
     assert stored.status == "completed"
     # One ``completed`` write; a tune checks both sidecars at it.
     assert seen == ([True] if job_type == "fit" else [True, True])
-    assert _frame_counts(broadcaster) == (1, 0)
+    assert _frame_counts(broadcaster, job.job_id) == (1, 0)
 
 
 def test_results_are_on_disk_before_completed_is_written_in_subprocess_mode(
@@ -223,7 +234,7 @@ def test_results_are_on_disk_before_completed_is_written_in_subprocess_mode(
     assert stored.status == "completed"
     assert stored.tune_result is not None
     assert seen == [True, True]
-    assert _frame_counts(broadcaster) == (1, 0)
+    assert _frame_counts(broadcaster, job.job_id) == (1, 0)
 
 
 # --- #767: one terminal frame and one metric when a write fails -------------
@@ -235,18 +246,19 @@ def test_a_failed_results_write_fails_the_job_with_one_frame_and_one_metric(
     use_subprocess: dict[str, bool],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#767 case 1: the completion's results write raises once."""
+    """#767 case 1: the completion's ``fit_result.json`` sidecar write raises
+    once, inside the real :meth:`JobMetadataStore.update`."""
     counted = _count_terminal(job_store, monkeypatch)
-    original_update = JobMetadataStore.update
+    original_write = metadata_mod.write_job_json
     failed = {"n": 0}
 
-    def flaky_update(store: JobMetadataStore, job: Job) -> None:
-        if job.fit_result is not None and failed["n"] == 0:
+    def flaky_write_job_json(path: Path, payload: Any) -> None:
+        if path.name == "fit_result.json" and failed["n"] == 0:
             failed["n"] += 1
             raise OSError("synthetic sidecar failure")
-        original_update(store, job)
+        original_write(path, payload)
 
-    monkeypatch.setattr(JobMetadataStore, "update", flaky_update)
+    monkeypatch.setattr(metadata_mod, "write_job_json", flaky_write_job_json)
     broadcaster = MagicMock(spec=ProgressBroadcaster)
     job = _claimed_job(job_store, "fit")
     ws = WorkspaceState(backend=backend)
@@ -268,7 +280,7 @@ def test_a_failed_results_write_fails_the_job_with_one_frame_and_one_metric(
     assert stored.status == "failed"
     assert "synthetic sidecar failure" in (stored.error or "")
     assert counted == ["failed"]
-    assert _frame_counts(broadcaster) == (0, 1)
+    assert _frame_counts(broadcaster, job.job_id) == (0, 1)
     assert job_store.active_job_id is None
 
 
@@ -315,5 +327,5 @@ def test_a_failed_missing_data_write_is_retried_with_one_frame_and_one_metric(
     assert stored is not None
     assert stored.status == "failed"
     assert counted == ["failed"]
-    assert _frame_counts(broadcaster) == (0, 1)
+    assert _frame_counts(broadcaster, job.job_id) == (0, 1)
     assert job_store.active_job_id is None
