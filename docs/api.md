@@ -15,16 +15,85 @@ When the server is running, visit:
 
 - **Base path:** `/api`
 - **Content-Type:** `application/json` (except file uploads)
-- **Error format:**
-  ```json
-  {
-    "error": {
-      "code": "JOB_NOT_FOUND",
-      "message": "Job not found: job_042",
-      "details": {}
+- **Success means committed:** a `2xx` from `/api/workspace/**` means the side
+  effect happened (P-0110). There is no `saved` flag to check.
+- **Error format** depends on the path (P-0110):
+
+  | Path | Media type | Body |
+  |------|------------|------|
+  | `/api/workspace` and below | `application/problem+json` | RFC 9457 Problem Details |
+  | Every other path (`/api/jobs/**`, `/api/inference/**`, `/api/files/**`, ...) | `application/json` | Legacy `{"error": {...}}` envelope |
+
+### Problem Details (`/api/workspace/**`)
+
+Every member is always present. `type` is always `"about:blank"`, so `title`
+is the HTTP reason phrase of `status`; the problem is identified by `code`
+(see [Error codes](#error-codes)). `detail` is the human-readable message,
+`details` carries the structured payload (`job_id`, `recovery_hint`, ...), and
+`validation_errors` is the list of validation entries on `VALIDATION_ERROR`
+and `null` otherwise. The OpenAPI component is `ProblemDetails`.
+
+`422` — blocking config validation (`PUT /config`, `POST /config/upload`,
+`POST /fit`, `POST /tune`). The config was **not** saved:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Unprocessable Entity",
+  "status": 422,
+  "detail": "Config validation failed",
+  "code": "VALIDATION_ERROR",
+  "details": {},
+  "validation_errors": [
+    {
+      "path": "split.n_splits",
+      "message": "n_splits=1000 is greater than the number of samples in the loaded dataset (n_rows=50). Reduce Folds to at most 50.",
+      "severity": "error",
+      "suggested_fix": "Set Folds (split.n_splits) to 50 or fewer."
     }
+  ]
+}
+```
+
+On `PUT /config` and `POST /config/upload`, `validation_errors` carries every
+entry, warnings included; only `severity: "error"` entries cause the 422.
+`POST /fit` and `POST /tune` list the blocking entries only.
+
+`409` — a config write while a job is running:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Conflict",
+  "status": 409,
+  "detail": "Config is locked while job job_042 is running",
+  "code": "WORKSPACE_LOCKED",
+  "details": { "job_id": "job_042" },
+  "validation_errors": null
+}
+```
+
+Other workspace errors (`WORKSPACE_NO_DATA`, `PATH_NOT_FOUND`, `FILE_INVALID`,
+...) use the same shape with their own `status` and `code`.
+
+`title` is the reason phrase of the running Python's `http.HTTPStatus`; for
+422 it is `"Unprocessable Content"` on Python 3.13 and later. Match on
+`status` and `code`, not on `title`.
+
+A request body that cannot be parsed at all (FastAPI's request validation)
+still answers `422` with the legacy envelope below, on every path.
+
+### Legacy envelope (every other path)
+
+```json
+{
+  "error": {
+    "code": "JOB_NOT_FOUND",
+    "message": "Job not found: job_042",
+    "details": {}
   }
-  ```
+}
+```
 
 ## Endpoints
 
@@ -44,10 +113,10 @@ When the server is running, visit:
 | GET | `/api/workspace/config/schema` | JSON Schema for config form |
 | GET | `/api/workspace/config/defaults` | Default config (query: `task`, `target`) |
 | GET | `/api/workspace/config` | Current config |
-| PUT | `/api/workspace/config` | Replace config |
+| PUT | `/api/workspace/config` | Replace config. `200 {config, validation_errors}` when saved (`validation_errors` holds warnings only); `422` Problem Details when a blocking entry refuses it; `409 WORKSPACE_LOCKED` while a job runs |
 | PATCH | `/api/workspace/config` | Partial config update |
 | POST | `/api/workspace/config/validate` | Validate config (dry run) |
-| POST | `/api/workspace/config/upload` | Load config from YAML/JSON file |
+| POST | `/api/workspace/config/upload` | Load config from YAML/JSON file. Same responses as `PUT /api/workspace/config`; `400` when the file cannot be read or parsed |
 | GET | `/api/workspace/config/download` | Download config as YAML |
 
 ### Workspace — Data

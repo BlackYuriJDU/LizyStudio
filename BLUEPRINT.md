@@ -2461,10 +2461,10 @@ Workspace の揮発状態を管理する。
 | GET | `/api/workspace/config/schema` | Config の JSON Schema を返す |
 | GET | `/api/workspace/config/defaults` | 完全なデフォルト Config を返す（query: `task`, `target`）(H-0025) |
 | GET | `/api/workspace/config` | 現在の Config を返す（legacy compat — `tuning` block は `ws.tuning_overrides` から sparse 投影） |
-| PUT | `/api/workspace/config` | Config を更新（バリデーション付き）。body 内の `tuning` block は `absorb_legacy_tuning` 経由で `ws.tuning_overrides` に吸収される (P-0109 PR-4b 互換 shim) |
+| PUT | `/api/workspace/config` | Config を更新（バリデーション付き）。保存できたら 200 `{config, validation_errors}`（`validation_errors` は warning / info だけ）、blocking なエラーがあれば保存せず 422 Problem Details（P-0110、§6.1.1）。body 内の `tuning` block は `absorb_legacy_tuning` 経由で `ws.tuning_overrides` に吸収される (P-0109 PR-4b 互換 shim) |
 | PATCH | `/api/workspace/config` | Config を部分更新（指定キーのみマージ）（H-0037） |
 | POST | `/api/workspace/config/validate` | Config dict をバリデーションのみ行う |
-| POST | `/api/workspace/config/upload` | YAML/JSON ファイルから読み込み |
+| POST | `/api/workspace/config/upload` | YAML/JSON ファイルから読み込み。応答は `PUT /api/workspace/config` と同じ（200 = 保存済み、blocking なエラーは 422 Problem Details。P-0110） |
 | GET | `/api/workspace/config/download` | 現在の Config を YAML でダウンロード |
 | GET | `/api/workspace/config/tuning-snapshot` | Tune タブ用の effective + defaults 同梱応答 `{tuning_effective, tuning_defaults}`（P-0109 PR-4a / SSOT 読み path） |
 | PUT | `/api/workspace/config/tuning-overrides` | sparse `TuningOverrides` を `ws.tuning_overrides` に outright replace。新 effective を echo（P-0109 PR-4a / SSOT 書き path） |
@@ -2528,7 +2528,7 @@ Workspace の `workspace_result` は完了時に自動更新される。
 
 #### Validate response envelope (P-0100 / P-0101 / Issue #394)
 
-`POST /api/workspace/config/validate` / `PUT /api/workspace/config` / `POST /api/workspace/upload` の `errors[]` 各要素は以下の envelope を返す:
+`POST /api/workspace/config/validate` の `errors[]`、`PUT /api/workspace/config` / `POST /api/workspace/config/upload` の `validation_errors[]`（200 本文と 422 Problem Details の両方。P-0110）の各要素は以下の envelope を返す。実際の key は `path` / `message` / `severity` / `suggested_fix` で、下の例の `loc` / `msg` は旧表記:
 
 ```json
 {
@@ -2546,10 +2546,10 @@ Workspace の `workspace_result` は完了時に自動更新される。
 
 | フィールド | 型 | 説明 |
 |---|---|---|
-| `severity` | `"error" \| "warning" \| "info"` (default `"error"`) | block 判定に使う。`"error"` のみ `valid=false` / `saved=false` を flip。`"warning"` / `"info"` は advisory のみ |
+| `severity` | `"error" \| "warning" \| "info"` (default `"error"`) | block 判定に使う。`"error"` のみ `valid=false` にし、`PUT /config` / `POST /config/upload` を 422 にする（P-0110。旧 `saved=false`）。`"warning"` / `"info"` は advisory のみで、200 の `validation_errors` に同居する |
 | `suggested_fix` | `str \| null` (default `null`) | 警告に対する具体的な置換アクション。Frontend では yellow banner の二行目に表示 |
 
-**Block 判定ルール (P-0100):** `_blocking_errors([entry, ...])` ヘルパが Service / API 層共通で `severity == "error"` のみを抽出し、`POST /fit` / `POST /tune` / `PUT /config` / `POST /upload` の 4xx 判定に使う。`severity` 未設定の旧 ValidationError は backward-compat のため `"error"` 扱い。
+**Block 判定ルール (P-0100 / P-0110):** `_blocking_errors([entry, ...])` ヘルパが Service / API 層共通で `severity == "error"` のみを抽出し、`POST /fit` / `POST /tune` / `PUT /config` / `POST /config/upload` の 422 判定に使う。`PUT /config` / `POST /config/upload` の 422 は warning を含む全 entry を `validation_errors` に載せる。`POST /fit` / `POST /tune` の 422 は blocking な entry だけを載せる。`severity` 未設定の旧 ValidationError は backward-compat のため `"error"` 扱い。
 
 **Metric-compat watchlist (P-0101):** `task=regression` のとき以下の組み合わせは `severity="warning"` で auto-disable される:
 
@@ -3028,6 +3028,44 @@ lizystudio_active_jobs 0.0
 
 > `LegacyFormatProtectionError`（§3.4.4 / P-0103）は専用エラーコードを持たず、`INTERNAL_ERROR` (500) として surface する。発生条件（旧 format_version の disk ファイル上書き）は通常運用では起きないため。recovery 手順は環境変数 `LIZYSTUDIO_ALLOW_LEGACY_WRITE=1`。
 
+#### 6.1.1 エラー本文の形（P-0110）
+
+エラー本文は path で 2 つに分かれる。
+
+| path | media type | 本文 |
+|---|---|---|
+| `/api/workspace` とその下（`/api/workspace/**`） | `application/problem+json` | RFC 9457 Problem Details |
+| それ以外（`/api/jobs/**`、`/api/inference/**`、`/api/files/**` など） | `application/json` | 従来の `{"error": {"code", "message", "details"}}` |
+
+- `/api/workspace/**` が 2xx を返したら、副作用（config の保存など）は確定している（INV-API-1）。本文に `saved` は無い。
+- Problem Details の member は常にすべて送る: `type`（常に `"about:blank"`）、`title`（HTTP の reason phrase）、`status`、`detail`（旧 `message`）、`code`（§6.1 のコード）、`details`（旧 `details`。`job_id`、`recovery_hint` など）、`validation_errors`（`VALIDATION_ERROR` では entry の配列、それ以外は `null`）。OpenAPI の component は `ProblemDetails`。
+- blocking な validation（`severity == "error"` の entry が 1 つ以上）は 422 `VALIDATION_ERROR`。`PUT /api/workspace/config`、`POST /api/workspace/config/upload`、`POST /api/workspace/fit`、`POST /api/workspace/tune` が返す。warning / info だけなら 200 で、entry は 200 本文の `validation_errors` に入る（P-0100 の severity 契約は変えない）。
+- 409 `WORKSPACE_LOCKED` も Problem Details で、`details.job_id` を持つ。
+- request body が parse できない（FastAPI の `RequestValidationError`）422 は、`/api/workspace/**` でも従来の envelope のまま（INV-API-4 の「別途 422」）。
+- 同じ `ValidationError` でも、job の relaunch gate（`POST /api/jobs/{id}/unpause`、retune / resume。P-0116 D5）が返すものは `/api/jobs/**` なので従来の envelope（`error.details.errors`）のまま。
+- frontend は `api/errors.ts` の accessor（`getErrorCode` / `isWorkspaceLocked` / `getValidationErrors` / `getErrorMessage`）で両方の形を読む。
+
+```json
+{
+  "type": "about:blank",
+  "title": "Unprocessable Entity",
+  "status": 422,
+  "detail": "Config validation failed",
+  "code": "VALIDATION_ERROR",
+  "details": {},
+  "validation_errors": [
+    {
+      "path": "split.n_splits",
+      "message": "n_splits=1000 is greater than the number of samples in the loaded dataset (n_rows=50). Reduce Folds to at most 50.",
+      "severity": "error",
+      "suggested_fix": "Set Folds (split.n_splits) to 50 or fewer."
+    }
+  ]
+}
+```
+
+`title` は実行中の Python の `http.HTTPStatus` の phrase（Python 3.13 以降の 422 は `"Unprocessable Content"`）。
+
 ### 6.2 バックエンドエラーの伝播
 
 バックエンドライブラリのエラー（例: LizyML の `LizyMLError`）は、adapter の 1 つの分類表（`backends/lizyml/error_mapping.py` の `RULES`）で 3 つに分ける（P-0117 D2）。表は code と `context` の形の両方で判定し、最初に合った行を使う。
@@ -3051,6 +3089,7 @@ lizystudio_active_jobs 0.0
 
 - API エラーは Toast（sonner）で画面上部に表示
 - バリデーションエラーはフォームフィールドにインラインで表示
+- config の書き込み（`PUT /api/workspace/config`、`POST /api/workspace/config/upload`）が 422 を返したら、`validation_errors` を errors state に入れ、最初の blocking な entry の message を toast に出し、config の cache は書き換えない（P-0110。旧 `saved=false` の扱いを 4xx に移した）。成功判定は HTTP status だけで行う
 - WebSocket の error メッセージは Training 画面のログに表示
 
 ---
