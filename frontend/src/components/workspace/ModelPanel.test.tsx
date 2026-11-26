@@ -10,6 +10,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { renderWithQuery } from "@/test/helpers";
+import { validationProblem } from "@/test/problemDetails";
 import { ModelPanel } from "./ModelPanel";
 
 vi.mock("sonner", () => ({
@@ -263,9 +264,9 @@ describe("ModelPanel", () => {
 
   it("shows validation errors after import with errors", async () => {
     const { uploadConfig } = await import("@/api/workspace");
-    (uploadConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
-      errors: [{ path: "model.name", message: "Invalid model" }],
-    });
+    (uploadConfig as ReturnType<typeof vi.fn>).mockRejectedValue(
+      validationProblem([{ path: "model.name", message: "Invalid model" }]),
+    );
 
     renderWithQuery(
       <ModelPanel
@@ -295,9 +296,9 @@ describe("ModelPanel", () => {
 
   it("disables Fit button when validation errors exist", async () => {
     const { uploadConfig } = await import("@/api/workspace");
-    (uploadConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
-      errors: [{ path: "model.name", message: "Invalid model" }],
-    });
+    (uploadConfig as ReturnType<typeof vi.fn>).mockRejectedValue(
+      validationProblem([{ path: "model.name", message: "Invalid model" }]),
+    );
 
     renderWithQuery(
       <ModelPanel
@@ -337,9 +338,9 @@ describe("ModelPanel", () => {
     const mockUpload = uploadConfig as ReturnType<typeof vi.fn>;
 
     // First import: has errors
-    mockUpload.mockResolvedValueOnce({
-      errors: [{ path: "model.name", message: "Invalid model" }],
-    });
+    mockUpload.mockRejectedValueOnce(
+      validationProblem([{ path: "model.name", message: "Invalid model" }]),
+    );
 
     renderWithQuery(
       <ModelPanel
@@ -367,7 +368,7 @@ describe("ModelPanel", () => {
     });
 
     // Second import: no errors
-    mockUpload.mockResolvedValueOnce({ errors: [] });
+    mockUpload.mockResolvedValueOnce({ config: {}, validation_errors: [] });
     const goodFile = new File(["model: lgbm"], "good.yaml", {
       type: "text/yaml",
     });
@@ -409,7 +410,8 @@ describe("ModelPanel", () => {
   it("handles Import YAML file selection", async () => {
     const { uploadConfig } = await import("@/api/workspace");
     (uploadConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
-      errors: [],
+      config: {},
+      validation_errors: [],
     });
     const { toast } = await import("sonner");
     (toast as unknown as Record<string, ReturnType<typeof vi.fn>>).success =
@@ -1004,12 +1006,12 @@ describe("ModelPanel", () => {
 
   it("renders error messages with path and message joined", async () => {
     const { uploadConfig } = await import("@/api/workspace");
-    (uploadConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
-      errors: [
+    (uploadConfig as ReturnType<typeof vi.fn>).mockRejectedValue(
+      validationProblem([
         { path: "model.params.depth", message: "Must be > 0" },
         { path: "", message: "General error" },
-      ],
-    });
+      ]),
+    );
 
     renderWithQuery(
       <ModelPanel

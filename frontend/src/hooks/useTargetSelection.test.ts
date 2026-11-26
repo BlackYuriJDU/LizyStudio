@@ -18,6 +18,8 @@ import {
   type CvState,
   INITIAL_CV_STATE,
 } from "@/components/workspace/cv-state";
+import { N_SPLITS_ERROR, validationProblem } from "@/test/problemDetails";
+import type { WriteResult } from "./useConfigWriteFunnel";
 
 const mocks = vi.hoisted(() => ({
   fetchColumns: vi.fn(),
@@ -272,6 +274,97 @@ describe("useTargetSelection", () => {
       });
 
       expect(deps.setBlocked).not.toHaveBeenCalled();
+    });
+  });
+
+  // P-0110: the target-select PUT goes through the write funnel. A 422
+  // rejection used to arrive as a 200 with saved=false that this hook
+  // never read; it is now a failed WriteResult and must be surfaced.
+  describe("funnel write result (P-0110)", () => {
+    function renderWithFunnel(result: WriteResult) {
+      const enqueueWrite = vi.fn(async () => result);
+      const onDataChanged = fn();
+      const { result: hook } = renderHook(
+        () =>
+          useTargetSelection({
+            task: null,
+            cv: INITIAL_CV_STATE,
+            blocked: INITIAL_BLOCKED_STATE,
+            dataPath: "/data/x.csv",
+            uiSchema: undefined,
+            setTarget: fn(),
+            setTask: fn(),
+            setCv: fn(),
+            setBlocked: fn(),
+            setColumns: fn(),
+            setOverrides: fn(),
+            setSyncSuppressed: fn(),
+            preseedSyncKey: fn(),
+            onDataChanged,
+            onTaskChanged: fn(),
+            writeFunnel: { enqueueWrite, isFlushing: () => false },
+          }),
+        { wrapper: createWrapper() },
+      );
+      return { hook, enqueueWrite };
+    }
+
+    beforeEach(() => {
+      mocks.fetchColumns.mockResolvedValue(COLS_OK);
+      mocks.fetchConfigDefaults.mockResolvedValue({
+        config_version: 1,
+        task: "binary",
+        data: {},
+        features: {},
+        split: { method: "kfold", n_splits: 5 },
+        model: { name: "lgbm", params: {} },
+      });
+    });
+
+    it("surfaces a 422 rejection in exactly one error toast", async () => {
+      const { hook, enqueueWrite } = renderWithFunnel({
+        ok: false,
+        error: "rejected",
+        details: validationProblem(),
+      });
+
+      await act(async () => {
+        await hook.current.handleTargetChange("a");
+      });
+
+      expect(enqueueWrite).toHaveBeenCalledTimes(1);
+      expect(mocks.toastError).toHaveBeenCalledTimes(1);
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        `Config not saved: ${N_SPLITS_ERROR.message}`,
+      );
+    });
+
+    it("does not toast an aborted write", async () => {
+      const { hook, enqueueWrite } = renderWithFunnel({
+        ok: false,
+        error: "aborted",
+      });
+
+      await act(async () => {
+        await hook.current.handleTargetChange("a");
+      });
+
+      expect(enqueueWrite).toHaveBeenCalledTimes(1);
+      expect(mocks.toastError).not.toHaveBeenCalled();
+    });
+
+    it("does not toast a committed write", async () => {
+      const { hook, enqueueWrite } = renderWithFunnel({
+        ok: true,
+        saved: { config: {}, validation_errors: [] },
+      });
+
+      await act(async () => {
+        await hook.current.handleTargetChange("a");
+      });
+
+      expect(enqueueWrite).toHaveBeenCalledTimes(1);
+      expect(mocks.toastError).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { ApiError } from "@/api/client";
-import { isStudioError } from "@/api/errors";
+import { isWorkspaceLocked } from "@/api/errors";
 import { updateConfig } from "@/api/workspace";
 
 /**
@@ -224,13 +224,13 @@ function classifyPutError(err: unknown): {
   details: unknown;
 } {
   if (err instanceof ApiError) {
-    if (
-      err.status === 409 &&
-      isStudioError(err.body) &&
-      err.body.error.code === "WORKSPACE_LOCKED"
-    ) {
+    // P-0110: PUT /config answers RFC 9457 Problem Details; the accessor
+    // reads the code from either envelope.
+    if (isWorkspaceLocked(err)) {
       return { error: "locked", details: err };
     }
+    // A blocking validation rejection is a 422 here (P-0110), so the
+    // backend not saving the body always lands on this branch.
     if (err.status >= 400 && err.status < 500) {
       return { error: "rejected", details: err };
     }

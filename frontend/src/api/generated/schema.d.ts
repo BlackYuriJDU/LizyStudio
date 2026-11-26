@@ -1411,20 +1411,24 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** ConfigUpdateResponse */
+        /**
+         * ConfigUpdateResponse
+         * @description 200 body of ``PUT /config`` and ``POST /config/upload`` (P-0110).
+         *
+         *     A 200 means the config was saved (INV-API-1), so there is no
+         *     ``saved`` flag. ``validation_errors`` holds only non-blocking
+         *     entries (``severity`` ``"warning"`` / ``"info"``, P-0100); a blocking
+         *     entry answers 422 :class:`ProblemDetails` instead.
+         */
         ConfigUpdateResponse: {
             /** Config */
             config: {
                 [key: string]: unknown;
             };
-            /** Errors */
-            errors: {
+            /** Validation Errors */
+            validation_errors: {
                 [key: string]: unknown;
             }[];
-            /** Saved */
-            saved: boolean;
-        } & {
-            [key: string]: unknown;
         };
         /** DataLoadResponse */
         DataLoadResponse: {
@@ -2437,6 +2441,42 @@ export interface components {
             message: string;
         };
         WsMessage: components["schemas"]["WsProgress"] | components["schemas"]["WsCompleted"] | components["schemas"]["WsError"] | components["schemas"]["WsPing"] | components["schemas"]["WsPaused"] | components["schemas"]["WsWarning"];
+        /**
+         * ProblemDetails
+         * @description RFC 9457 error body of the workspace endpoints (P-0110).
+         *
+         *     Served as ``application/problem+json``. ``type`` is always
+         *     ``about:blank`` (Decision Q2), so ``title`` is the HTTP reason
+         *     phrase; ``code`` is the LizyStudio error code (BLUEPRINT §6.1).
+         *     Every member is always sent; ``validation_errors`` is a list on
+         *     ``VALIDATION_ERROR`` and null otherwise.
+         */
+        ProblemDetails: {
+            /**
+             * Type
+             * @default about:blank
+             */
+            type: string;
+            /** Title */
+            title: string;
+            /** Status */
+            status: number;
+            /** Detail */
+            detail: string;
+            /** Code */
+            code: string;
+            /** Details */
+            details?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Validation Errors
+             * @default null
+             */
+            validation_errors: {
+                [key: string]: unknown;
+            }[] | null;
+        };
     };
     responses: never;
     parameters: never;
@@ -2796,13 +2836,22 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigUpdateResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Conflict, e.g. WORKSPACE_LOCKED or JOB_CONFLICT (RFC 9457 Problem Details) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Blocking config validation, VALIDATION_ERROR with validation_errors (RFC 9457 Problem Details). A request body that fails to parse still answers 422 with the legacy error envelope. */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
         };
@@ -2952,13 +3001,22 @@ export interface operations {
                     "application/json": components["schemas"]["ConfigUpdateResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Request refused (RFC 9457 Problem Details) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Blocking config validation, VALIDATION_ERROR with validation_errors (RFC 9457 Problem Details). A request body that fails to parse still answers 422 with the legacy error envelope. */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
         };
@@ -3005,13 +3063,31 @@ export interface operations {
                     "application/json": components["schemas"]["JobStartResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Request refused (RFC 9457 Problem Details) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Conflict, e.g. WORKSPACE_LOCKED or JOB_CONFLICT (RFC 9457 Problem Details) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Blocking config validation, VALIDATION_ERROR with validation_errors (RFC 9457 Problem Details). A request body that fails to parse still answers 422 with the legacy error envelope. */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
         };
@@ -3038,13 +3114,31 @@ export interface operations {
                     "application/json": components["schemas"]["JobStartResponse"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Request refused (RFC 9457 Problem Details) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Conflict, e.g. WORKSPACE_LOCKED or JOB_CONFLICT (RFC 9457 Problem Details) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Blocking config validation, VALIDATION_ERROR with validation_errors (RFC 9457 Problem Details). A request body that fails to parse still answers 422 with the legacy error envelope. */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
         };

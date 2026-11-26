@@ -171,27 +171,20 @@ describe("PreviewResponse", () => {
 // ConfigUpdateResponse + ConfigError
 // ---------------------------------------------------------------------------
 describe("ConfigUpdateResponse", () => {
-  it("has config, errors, and saved", () => {
-    const err: ConfigError = { path: "model.name", message: "required" };
+  it("has config and validation_errors (P-0110: no saved flag)", () => {
+    const warning: ConfigError = {
+      path: "evaluation.metrics",
+      message: "MAPE is undefined",
+      severity: "warning",
+    };
     const resp: ConfigUpdateResponse = {
       config: { model: { name: "lgbm" } },
-      errors: [err],
-      saved: false,
+      validation_errors: [warning],
     };
     assertDefined(resp.config, "config");
-    expect(resp.errors).toHaveLength(1);
-    expect(resp.errors[0].path).toBe("model.name");
-    expect(resp.saved).toBe(false);
-  });
-
-  it("saved=true means the backend persisted the PUT body (Issue #276)", () => {
-    const resp: ConfigUpdateResponse = {
-      config: { model: { name: "lgbm" } },
-      errors: [],
-      saved: true,
-    };
-    expect(resp.saved).toBe(true);
-    expect(resp.errors).toHaveLength(0);
+    expect(resp.validation_errors).toHaveLength(1);
+    expect(resp.validation_errors[0].path).toBe("evaluation.metrics");
+    expect(Object.keys(resp).sort()).toEqual(["config", "validation_errors"]);
   });
 });
 

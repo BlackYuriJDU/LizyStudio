@@ -1,6 +1,10 @@
 import { useCallback } from "react";
 import { toast } from "sonner";
-import { getErrorMessage } from "@/api/errors";
+import {
+  getErrorMessage,
+  getValidationErrors,
+  summarizeValidationErrors,
+} from "@/api/errors";
 import type { ColumnInfo, UiSchema } from "@/api/types";
 import { fetchColumns, fetchConfigDefaults } from "@/api/workspace";
 import type { BlockedGroupKFoldState } from "@/components/workspace/BlockedGroupKFoldEditor";
@@ -121,7 +125,7 @@ export function useTargetSelection({
           // task-keyed eval registry. Without this the merged-config PUT
           // ships `evaluation.metrics: []`, which lets MetricsChips'
           // task-change useEffect race the target-select PUT and emit a
-          // partial-body PUT that the backend rejects (saved=false).
+          // partial-body PUT that the backend rejects (422 since P-0110).
           const evaluationMetrics = evalMetricMap(uiSchema)[detectedTask] ?? [];
           const merged = buildMergedConfig({
             defaults,
@@ -147,11 +151,23 @@ export function useTargetSelection({
           // we want to migrate this writer without breaking unit
           // tests that drive it directly.
           if (writeFunnel) {
-            await writeFunnel.enqueueWrite({
+            const result = await writeFunnel.enqueueWrite({
               kind: "replace",
               config: merged,
               reason: "target-select",
             });
+            // P-0110: a rejected write (422 / 409 / network) is surfaced,
+            // not dropped. An aborted write means the caller tore down.
+            if (!result.ok && result.error !== "aborted") {
+              const validationErrors = getValidationErrors(result.details);
+              toast.error(
+                `Config not saved: ${
+                  validationErrors !== null
+                    ? summarizeValidationErrors(validationErrors)
+                    : getErrorMessage(result.details ?? result.error)
+                }`,
+              );
+            }
           } else if (legacyUpdateConfig) {
             await legacyUpdateConfig.putConfig(merged);
             legacyUpdateConfig.setQueryData(merged);

@@ -13,8 +13,12 @@ import { useQueryClient } from "@tanstack/react-query";
 import equal from "fast-deep-equal";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import { ApiError } from "@/api/client";
-import { getErrorMessage, isStudioError } from "@/api/errors";
+import {
+  getErrorMessage,
+  getValidationErrors,
+  isWorkspaceLocked,
+  summarizeValidationErrors,
+} from "@/api/errors";
 import {
   useBackends,
   useColumns,
@@ -63,7 +67,7 @@ export function useModelPanelData({
   // P-0092 Q-1 Phase 4: pull the optional write funnel from the
   // Workspace-level provider so handleConfigChange / handleUndo /
   // handleRedo serialise behind in-flight target-select / cv-change
-  // writers. The hook still owns the saved=false / 409 / debounce
+  // writers. The hook still owns the 422 / 409 / debounce
   // observation logic — the funnel only owns the network call ordering.
   // Tests inject `writeFunnel` directly via params; production reads
   // from context.
@@ -130,18 +134,40 @@ export function useModelPanelData({
       if (cached && equal(cached, newConfig)) {
         return;
       }
-      // INV-A1/A2/A3 (Issue #276): observe `saved` from PUT /config and
-      // do not silently swallow validation rejections. When saved=false
-      // the backend kept the prior config, so the cache, history, and
-      // errors state must reflect that — not the rejected payload.
+      // INV-A1/A2/A3 (Issue #276) + P-0110: a blocking validation
+      // rejection is a 422 Problem Details error, never a 200. The
+      // backend kept the prior config, so the cache, history, and errors
+      // state must reflect that — not the rejected payload.
       //
       // P-0092 Q-1 Phase 4: route through the write funnel when one is
       // mounted so this user-edit PUT serialises behind any in-flight
       // target-select / cv-change writer. The funnel's WriteResult
-      // carries the raw `ConfigUpdateResponse` in `saved` (success) or
-      // the original error in `details` (failure), so the existing
-      // saved=false / 409 observation logic stays right here.
-      let response: Awaited<ReturnType<typeof updateConfig>>;
+      // carries the original error in `details` on failure, so the
+      // 422 / 409 observation logic stays right here.
+      const rejectWrite = (err: unknown): void => {
+        // P-0089 / Issue #279: 409 WORKSPACE_LOCKED means a fit/tune
+        // job is running and the config is intentionally immutable.
+        // Surface a quiet info toast (the section-level disabled
+        // controls already explain the lock) and re-fetch so the form
+        // resyncs to the locked-in config.
+        if (isWorkspaceLocked(err)) {
+          toast.info("Config is locked while a job is running");
+          queryClient.invalidateQueries({ queryKey: queryKeys.config() });
+          return;
+        }
+        const validationErrors = getValidationErrors(err);
+        if (validationErrors !== null) {
+          setErrors(validationErrors);
+          toast.error(
+            `Config not saved: ${summarizeValidationErrors(validationErrors)}`,
+          );
+          // Re-fetch the actual backend state so the UI reflects truth,
+          // not the rejected payload the caller tried to apply.
+          queryClient.invalidateQueries({ queryKey: queryKeys.config() });
+          return;
+        }
+        toast.error("Failed to update config");
+      };
       try {
         if (writeFunnel) {
           const result = await writeFunnel.enqueueWrite({
@@ -150,54 +176,14 @@ export function useModelPanelData({
             reason: "config-form-edit",
           });
           if (!result.ok) {
-            const err = result.details;
-            if (
-              err instanceof ApiError &&
-              err.status === 409 &&
-              isStudioError(err.body) &&
-              err.body.error.code === "WORKSPACE_LOCKED"
-            ) {
-              toast.info("Config is locked while a job is running");
-              queryClient.invalidateQueries({ queryKey: queryKeys.config() });
-              return;
-            }
-            toast.error("Failed to update config");
+            rejectWrite(result.details);
             return;
           }
-          response = result.saved as unknown as Awaited<
-            ReturnType<typeof updateConfig>
-          >;
         } else {
-          response = await updateConfig(newConfig);
+          await updateConfig(newConfig);
         }
       } catch (err) {
-        // P-0089 / Issue #279: 409 WORKSPACE_LOCKED means a fit/tune
-        // job is running and the config is intentionally immutable.
-        // Surface a quiet info toast (the section-level disabled
-        // controls already explain the lock) and re-fetch so the form
-        // resyncs to the locked-in config.
-        if (
-          err instanceof ApiError &&
-          err.status === 409 &&
-          isStudioError(err.body) &&
-          err.body.error.code === "WORKSPACE_LOCKED"
-        ) {
-          toast.info("Config is locked while a job is running");
-          queryClient.invalidateQueries({ queryKey: queryKeys.config() });
-          return;
-        }
-        toast.error("Failed to update config");
-        return;
-      }
-      if (response?.saved === false) {
-        const errs = response.errors ?? [];
-        setErrors(errs);
-        const summary =
-          errs[0]?.message ?? "Config rejected by backend validation";
-        toast.error(`Config not saved: ${summary}`);
-        // Re-fetch the actual backend state so the UI reflects truth,
-        // not the rejected payload the caller tried to apply.
-        queryClient.invalidateQueries({ queryKey: queryKeys.config() });
+        rejectWrite(err);
         return;
       }
       queryClient.setQueryData(queryKeys.config(), newConfig);
@@ -226,10 +212,20 @@ export function useModelPanelData({
     async (file: File) => {
       try {
         const result = await uploadConfig(file);
-        setErrors(result.errors);
+        setErrors(result.validation_errors);
         queryClient.invalidateQueries({ queryKey: queryKeys.config() });
         toast.success("Config imported");
       } catch (err) {
+        // P-0110: a config that fails validation is a 422, not a 200
+        // with saved=false — show why, and keep the prior config.
+        const validationErrors = getValidationErrors(err);
+        if (validationErrors !== null) {
+          setErrors(validationErrors);
+          toast.error(
+            `Import failed: ${summarizeValidationErrors(validationErrors)}`,
+          );
+          return;
+        }
         toast.error(`Import failed: ${getErrorMessage(err)}`);
       }
     },

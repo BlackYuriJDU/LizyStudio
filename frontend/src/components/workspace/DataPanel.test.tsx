@@ -765,8 +765,7 @@ describe("DataPanel — handleTargetChange", () => {
     });
     mockUpdateConfig.mockResolvedValue({
       config: {},
-      errors: [],
-      saved: true,
+      validation_errors: [],
     });
 
     render(<DataPanel onDataChanged={vi.fn()} />);

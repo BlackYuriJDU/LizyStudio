@@ -33,6 +33,10 @@ vi.mock("sonner", () => ({
 import { queryKeys } from "@/api/queryKeys";
 import { INITIAL_BLOCKED_STATE } from "@/components/workspace/BlockedGroupKFoldEditor";
 import { INITIAL_CV_STATE } from "@/components/workspace/cv-state";
+import {
+  validationProblem,
+  workspaceLockedProblem,
+} from "@/test/problemDetails";
 import { useConfigSync } from "./useConfigSync";
 import type { ColumnOverride, TaskType } from "./useDataPanel.types";
 
@@ -311,10 +315,10 @@ describe("useConfigSync", () => {
     expect(retried.split.n_splits).toBe(7);
   });
 
-  // Review r2: a validation rejection is an HTTP 200 with saved=false, so it
-  // must not count as the strategy having been persisted either.  The
-  // decision now reads the persisted base (GET), not a client-side ref.
-  it("a saved=false strategy change re-applies the automatic marker on the next sync", async () => {
+  // Review r2: a validation rejection (a 422 since P-0110) must not count
+  // as the strategy having been persisted either.  The decision reads the
+  // persisted base (GET), not a client-side ref.
+  it("a 422-rejected strategy change re-applies the automatic marker on the next sync", async () => {
     mocks.fetchConfig.mockResolvedValue({
       ...baseConfig,
       training: {
@@ -332,11 +336,9 @@ describe("useConfigSync", () => {
     );
     await waitFor(() => expect(mocks.updateConfig).toHaveBeenCalledTimes(1));
 
-    mocks.updateConfig.mockResolvedValueOnce({
-      config: {},
-      errors: [{ path: "x" }],
-      saved: false,
-    });
+    mocks.updateConfig.mockRejectedValueOnce(
+      validationProblem([{ path: "x", message: "rejected" }]),
+    );
     const kfold = { ...INITIAL_CV_STATE, strategy: "kfold" };
     rerender({ cv: kfold });
     await waitFor(() => expect(mocks.updateConfig).toHaveBeenCalledTimes(2));
@@ -448,7 +450,7 @@ describe("useConfigSync", () => {
         return (
           stub?.(replace) ?? {
             ok: true as const,
-            saved: { config: replace.config, errors: [], saved: true },
+            saved: { config: replace.config, validation_errors: [] },
           }
         );
       });
@@ -548,18 +550,10 @@ describe("useConfigSync", () => {
     });
 
     it("surfaces info toast (not error) when funnel returns 409 WORKSPACE_LOCKED via details", async () => {
-      const { ApiError } = await import("@/api/client");
-      const lockErr = new ApiError(409, {
-        error: {
-          code: "WORKSPACE_LOCKED",
-          message: "Config is locked while job xyz is running",
-          details: { job_id: "xyz" },
-        },
-      });
       const { funnel } = createStubFunnel(() => ({
         ok: false,
         error: "network",
-        details: lockErr,
+        details: workspaceLockedProblem("xyz"),
       }));
       const { wrapper } = testWrapper;
       renderHook(
