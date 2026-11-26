@@ -320,6 +320,26 @@ def test_request_body_parse_error_keeps_legacy_envelope(client: TestClient) -> N
     assert res.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
+def test_unknown_workspace_route_is_problem(client: TestClient) -> None:
+    """The /api catch-all raises a StudioError, so it is Problem Details too."""
+    res = client.get("/api/workspace/does-not-exist")
+    assert res.status_code == 404, res.text
+    assert res.headers["content-type"].startswith(PROBLEM_JSON_MEDIA_TYPE)
+    _assert_matches_problem_schema(res.json())
+
+
+def test_framework_405_is_not_a_studio_error(client: TestClient) -> None:
+    """Only StudioErrors are serialized; a framework 405 keeps its body.
+
+    BLUEPRINT §6.1.1 and docs/api.md scope Problem Details to StudioErrors
+    under /api/workspace; this pins that boundary.
+    """
+    res = client.delete("/api/workspace/config")
+    assert res.status_code == 405, res.text
+    assert res.headers["content-type"].startswith("application/json")
+    assert res.json() == {"detail": "Method Not Allowed"}
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
