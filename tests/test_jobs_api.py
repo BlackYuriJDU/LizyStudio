@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -1362,6 +1363,46 @@ def test_export_job_backend_error(
 
     assert res.status_code == 500
     assert res.json()["error"]["code"] == "EXPORT_ERROR"
+
+
+@pytest.mark.parametrize(
+    ("export_type", "target"),
+    [("model", "export_model"), ("report", "export_report")],
+)
+def test_export_error_does_not_echo_exception_text(
+    client: TestClient,
+    sample_data_ref: DataRef,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    export_type: str,
+    target: str,
+) -> None:
+    """Exception text can embed training data; keep it in the log only (#777)."""
+    from unittest.mock import patch
+
+    job_id = _create_completed_job_with_model(
+        client, sample_data_ref, str(tmp_path / "model")
+    )
+    sentinel = "sentinel-training-value-c0ffee"
+    output_path = str(Path("/tmp").resolve() / "lizystudio_test_out")
+
+    with (
+        patch(
+            f"lizystudio.api.jobs.{target}",
+            side_effect=RuntimeError(f"cannot restore {sentinel}"),
+        ),
+        caplog.at_level(logging.ERROR, logger="lizystudio.api.jobs"),
+    ):
+        res = client.post(
+            f"/api/jobs/{job_id}/export",
+            json={"export_type": export_type, "output_path": output_path},
+        )
+
+    assert res.status_code == 500
+    assert res.json()["error"]["code"] == "EXPORT_ERROR"
+    assert sentinel not in res.text
+    assert sentinel in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
 
 
 def test_job_config_snapshot_isolation(

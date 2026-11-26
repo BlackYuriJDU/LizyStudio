@@ -7,6 +7,7 @@ export, delete.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import asdict
 from typing import Any, Literal  # noqa: UP035
@@ -76,6 +77,8 @@ from lizystudio.services.training import (
 )
 from lizystudio.services.workspace import WorkspaceState, get_workspace
 from lizystudio.ws.progress import ProgressBroadcaster
+
+logger = logging.getLogger(__name__)
 
 _MAX_METRICS = 20
 _VALID_PARAM_RE = re.compile(r"^[a-zA-Z0-9_]+$")
@@ -684,7 +687,11 @@ def export_job(
     except BackendRefusalError as exc:
         raise backend_error_from(exc) from exc
     except Exception as exc:
-        raise ExportError(str(exc)) from exc
+        # The exception text can embed values from the job's training data
+        # (#777). Answer with the class name only; the detail stays in the
+        # server log, with its traceback.
+        logger.exception("Model or report export failed for job %s", job_id)
+        raise ExportError(type(exc).__name__) from exc
 
 
 @router.get("/{job_id}/export-code", response_model=ExportCodeResponse)
