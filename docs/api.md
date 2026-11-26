@@ -17,12 +17,18 @@ When the server is running, visit:
 - **Content-Type:** `application/json` (except file uploads)
 - **Success means committed:** a `2xx` from `/api/workspace/**` means the side
   effect happened (P-0110). There is no `saved` flag to check.
-- **Error format** depends on the path (P-0110):
+- **Error format** of a LizyStudio error (one with a code from
+  [Error codes](#error-codes)) depends on the path (P-0110):
 
   | Path | Media type | Body |
   |------|------------|------|
   | `/api/workspace` and below | `application/problem+json` | RFC 9457 Problem Details |
   | Every other path (`/api/jobs/**`, `/api/inference/**`, `/api/files/**`, ...) | `application/json` | Legacy `{"error": {...}}` envelope |
+
+  Failures that are not LizyStudio errors keep the framework's default body
+  on every path: a `405` (`{"detail": "Method Not Allowed"}`) and an
+  unhandled `500`. An unknown `/api/workspace/...` route is a LizyStudio
+  `404 NOT_FOUND`, so it is Problem Details.
 
 ### Problem Details (`/api/workspace/**`)
 
@@ -116,7 +122,7 @@ still answers `422` with the legacy envelope below, on every path.
 | PUT | `/api/workspace/config` | Replace config. `200 {config, validation_errors}` when saved (`validation_errors` holds warnings only); `422` Problem Details when a blocking entry refuses it; `409 WORKSPACE_LOCKED` while a job runs |
 | PATCH | `/api/workspace/config` | Partial config update |
 | POST | `/api/workspace/config/validate` | Validate config (dry run) |
-| POST | `/api/workspace/config/upload` | Load config from YAML/JSON file. Same responses as `PUT /api/workspace/config`; `400` when the file cannot be read or parsed |
+| POST | `/api/workspace/config/upload` | Load config from YAML/JSON file. `200` and `422` as for `PUT /api/workspace/config`; `400` when the file cannot be read or parsed. It has no running-job lock check, so it never answers `409` |
 | GET | `/api/workspace/config/download` | Download config as YAML |
 
 ### Workspace — Data

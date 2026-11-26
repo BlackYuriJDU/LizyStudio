@@ -2464,7 +2464,7 @@ Workspace の揮発状態を管理する。
 | PUT | `/api/workspace/config` | Config を更新（バリデーション付き）。保存できたら 200 `{config, validation_errors}`（`validation_errors` は warning / info だけ）、blocking なエラーがあれば保存せず 422 Problem Details（P-0110、§6.1.1）。body 内の `tuning` block は `absorb_legacy_tuning` 経由で `ws.tuning_overrides` に吸収される (P-0109 PR-4b 互換 shim) |
 | PATCH | `/api/workspace/config` | Config を部分更新（指定キーのみマージ）（H-0037） |
 | POST | `/api/workspace/config/validate` | Config dict をバリデーションのみ行う |
-| POST | `/api/workspace/config/upload` | YAML/JSON ファイルから読み込み。応答は `PUT /api/workspace/config` と同じ（200 = 保存済み、blocking なエラーは 422 Problem Details。P-0110） |
+| POST | `/api/workspace/config/upload` | YAML/JSON ファイルから読み込み。200 と 422 は `PUT /api/workspace/config` と同じ（200 = 保存済み、blocking なエラーは 422 Problem Details。P-0110）。ファイルが読めない・parse できないときは 400。running-lock の検査は無いので 409 は返さない |
 | GET | `/api/workspace/config/download` | 現在の Config を YAML でダウンロード |
 | GET | `/api/workspace/config/tuning-snapshot` | Tune タブ用の effective + defaults 同梱応答 `{tuning_effective, tuning_defaults}`（P-0109 PR-4a / SSOT 読み path） |
 | PUT | `/api/workspace/config/tuning-overrides` | sparse `TuningOverrides` を `ws.tuning_overrides` に outright replace。新 effective を echo（P-0109 PR-4a / SSOT 書き path） |
@@ -3030,12 +3030,14 @@ lizystudio_active_jobs 0.0
 
 #### 6.1.1 エラー本文の形（P-0110）
 
-エラー本文は path で 2 つに分かれる。
+`StudioError`（§6.1 のコードを持つエラー）の本文は path で 2 つに分かれる。
 
 | path | media type | 本文 |
 |---|---|---|
 | `/api/workspace` とその下（`/api/workspace/**`） | `application/problem+json` | RFC 9457 Problem Details |
 | それ以外（`/api/jobs/**`、`/api/inference/**`、`/api/files/**` など） | `application/json` | 従来の `{"error": {"code", "message", "details"}}` |
+
+`StudioError` ではない失敗は対象外で、FastAPI / Starlette の既定の本文のまま: 405（`{"detail": "Method Not Allowed"}`）や、処理されない例外の 500。未知の `/api/workspace/...` route は catch-all が `StudioError` の 404 `NOT_FOUND` を投げるので Problem Details になる。
 
 - `/api/workspace/**` が 2xx を返したら、副作用（config の保存など）は確定している（INV-API-1）。本文に `saved` は無い。
 - Problem Details の member は常にすべて送る: `type`（常に `"about:blank"`）、`title`（HTTP の reason phrase）、`status`、`detail`（旧 `message`）、`code`（§6.1 のコード）、`details`（旧 `details`。`job_id`、`recovery_hint` など）、`validation_errors`（`VALIDATION_ERROR` では entry の配列、それ以外は `null`）。OpenAPI の component は `ProblemDetails`。
