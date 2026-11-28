@@ -107,6 +107,11 @@ function setNestedImmutable(
   if (Array.isArray(base)) {
     const result = [...base];
     const index = Number(head);
+    // Mirror setNestedValue: a non-integer index is ignored, not
+    // written as a `NaN` property.
+    if (head.trim() === "" || !Number.isInteger(index) || index < 0) {
+      return base;
+    }
     result[index] =
       rest.length === 0
         ? value

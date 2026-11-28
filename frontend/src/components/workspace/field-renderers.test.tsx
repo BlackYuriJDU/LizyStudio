@@ -611,6 +611,65 @@ describe("renderField — discriminated union", () => {
     expect(onChange).toHaveBeenCalledWith(["strategy", "value_b"], "edited");
   });
 
+  it("keeps a picked anyOf variant without defaults after a re-render", () => {
+    const schema: SchemaProperty = {
+      title: "Strategy",
+      anyOf: [
+        {
+          type: "object",
+          title: "Option A",
+          properties: {
+            mode: { type: "string", const: "a" },
+            value_a: { type: "number" },
+          },
+        },
+        {
+          type: "object",
+          title: "Option B",
+          properties: {
+            mode: { type: "string", const: "b" },
+            value_b: { type: "string" },
+          },
+        },
+      ],
+    };
+    const onChange = vi.fn();
+    renderNode(
+      renderField(
+        schema,
+        "strategy",
+        ["strategy"],
+        undefined,
+        onChange,
+        emptyDefs,
+      ),
+    );
+
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Strategy" }), {
+      key: "Enter",
+    });
+    fireEvent.click(screen.getByRole("option", { name: "Option B" }));
+
+    // The picked variant's const key is seeded, so the value can resolve
+    // back to Option B on the next render instead of falling to index 0.
+    expect(onChange).toHaveBeenCalledWith(["strategy"], { mode: "b" });
+
+    cleanup();
+    renderNode(
+      renderField(
+        schema,
+        "strategy",
+        ["strategy"],
+        { mode: "b" },
+        noop,
+        emptyDefs,
+      ),
+    );
+    expect(
+      screen.getByRole("combobox", { name: "Strategy" }),
+    ).toHaveTextContent("Option B");
+  });
+
   it("renders discriminated union with alternatives", () => {
     const prop: SchemaProperty = {
       alternatives: [

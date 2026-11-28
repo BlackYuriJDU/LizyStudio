@@ -49,10 +49,17 @@ export function setNestedValue(
   path: string[],
   value: unknown,
 ): Record<string, unknown> {
+  if (path.length === 0) return obj;
   if (Array.isArray(obj)) {
     const result = [...obj];
     const [first, ...rest] = path;
     const index = Number(first);
+    // A non-integer index (or an empty segment) would write a `NaN`
+    // property that JSON serialization then drops. Ignore the write
+    // instead, the same way setNestedImmutable does.
+    if (first.trim() === "" || !Number.isInteger(index) || index < 0) {
+      return obj;
+    }
     result[index] =
       rest.length === 0
         ? value

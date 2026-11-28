@@ -69,6 +69,28 @@ describe("setNestedValue", () => {
     const result = setNestedValue({}, ["key"], "value");
     expect(result).toEqual({ key: "value" });
   });
+
+  it("ignores a non-integer array index instead of writing a NaN property", () => {
+    const obj = { steps: ["first"] };
+    const result = setNestedValue(obj, ["steps", "x"], "updated");
+    expect(result).toEqual({ steps: ["first"] });
+    expect((result.steps as unknown[]).length).toBe(1);
+  });
+
+  it("ignores a negative or fractional array index", () => {
+    const arr = ["first", "second"];
+    expect(
+      setNestedValue(arr as unknown as Record<string, unknown>, ["-1"], "x"),
+    ).toBe(arr);
+    expect(
+      setNestedValue(arr as unknown as Record<string, unknown>, ["1.5"], "x"),
+    ).toBe(arr);
+  });
+
+  it("returns the input unchanged for an empty path", () => {
+    const obj = { a: 1 };
+    expect(setNestedValue(obj, [], 2)).toBe(obj);
+  });
 });
 
 describe("getNestedValue", () => {

@@ -67,6 +67,30 @@ describe("materializeOp", () => {
     });
   });
 
+  it("ignores a non-integer array index in a patch", () => {
+    const current: ConfigSnapshot = { steps: [{ name: "first" }] };
+    const op: WriteOp = {
+      kind: "patch",
+      path: ["steps", "x", "name"],
+      value: "nope",
+      reason: "config-form-edit",
+    };
+    expect(materializeOp(op, current)).toEqual({
+      steps: [{ name: "first" }],
+    });
+  });
+
+  it("leaves the snapshot untouched for an empty patch path", () => {
+    const current: ConfigSnapshot = { task: "binary" };
+    const op: WriteOp = {
+      kind: "patch",
+      path: [],
+      value: "ignored",
+      reason: "config-form-edit",
+    };
+    expect(materializeOp(op, current)).toBe(current);
+  });
+
   it("preserves arrays when patching a child field of an array item", () => {
     const current = {
       steps: [

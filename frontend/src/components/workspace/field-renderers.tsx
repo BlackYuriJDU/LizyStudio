@@ -388,7 +388,23 @@ function renderDiscriminatedUnion(
             const idx = Number(v);
             const alt = alternatives[idx];
             if (!alt) return;
-            onChange(path, alt.default ?? {});
+            // Seed the variant's const-keyed properties so the next
+            // render resolves back to this alternative instead of
+            // falling back to index 0 when it has no default.
+            const altDefault =
+              alt.default != null && typeof alt.default === "object"
+                ? (alt.default as Record<string, unknown>)
+                : {};
+            const seeded: Record<string, unknown> = { ...altDefault };
+            for (const [childName, childProp] of Object.entries(
+              alt.properties ?? {},
+            )) {
+              const resolved = resolveSchema(childProp as SchemaProperty, defs);
+              if (resolved.const !== undefined) {
+                seeded[childName] = resolved.const;
+              }
+            }
+            onChange(path, seeded);
           }}
         >
           <SelectTrigger aria-label={label} className="h-8 text-xs">
